@@ -182,7 +182,7 @@ export default {
         // ========================================================
         // Mensaje de Telegram formateado con campanitas
         // ========================================================
-        let textoTimbre = `🔔🔔🔔🔔🔔🔔🔔🔔🔔\n\n*🔔ESTÁN TOCANDO EL TIMBRE🔔*`;
+        let textoTimbre = `🔔🔔🔔🔔🔔🔔🔔🔔🔔\n\n*✅ESTÁN TOCANDO EL TIMBRE✅*`;
 
         if (cantidad === 3) {
           textoTimbre += `\n\n⚠️ Se alcanzó el límite de 3 toques.`;
