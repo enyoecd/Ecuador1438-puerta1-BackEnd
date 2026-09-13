@@ -1,7 +1,5 @@
 const CAMERA_KV_KEY = 'puerta1_camera_session';
 const CAMERA_SESSION_TTL_SECONDS = 7200;
-const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
-
 function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin || '*',
@@ -30,6 +28,13 @@ function buildViewerUrl(requestUrl, sessionId, puerta = '1') {
   return url.toString();
 }
 
+function createLocalSessionId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return 'local-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+}
+
 function escapeHtml(value) {
   const text = String(value ?? '');
   return text
@@ -47,54 +52,29 @@ async function getActiveCameraSession(kv) {
 
   try {
     const session = JSON.parse(raw);
-    if (!session || !session.sessionId) return null;
-    const now = Date.now();
-    if (session.expiresAt && now > session.expiresAt) {
+    if (!session || !session.sessionId || !session.startedAt || !Number.isFinite(Number(session.startedAt))) {
       await kv.delete(CAMERA_KV_KEY).catch(() => {});
       return null;
     }
-    return session;
+
+    const now = Date.now();
+    const startedAt = Number(session.startedAt);
+    const expiresAt = Number(session.expiresAt || startedAt + CAMERA_SESSION_TTL_SECONDS * 1000);
+
+    if (now > expiresAt || now - startedAt > CAMERA_SESSION_TTL_SECONDS * 1000) {
+      await kv.delete(CAMERA_KV_KEY).catch(() => {});
+      return null;
+    }
+
+    return {
+      ...session,
+      startedAt,
+      expiresAt
+    };
   } catch (_) {
     await kv.delete(CAMERA_KV_KEY).catch(() => {});
     return null;
   }
-}
-
-async function createCallsSession(appId, appSecret) {
-  const url = CALLS_API_BASE + '/' + appId + '/sessions/new';
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + appSecret,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({})
-  });
-
-  const text = await resp.text();
-  if (!resp.ok) {
-    throw new Error('Calls API error ' + resp.status + ': ' + text);
-  }
-
-  try {
-    return JSON.parse(text);
-  } catch (_) {
-    return { sessionId: text };
-  }
-}
-
-async function closeCallsSession(appId, appSecret, sessionId) {
-  if (!appId || !appSecret || !sessionId) return true;
-  const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/close';
-  const resp = await fetch(url, {
-    method: 'PUT',
-    headers: {
-      Authorization: 'Bearer ' + appSecret,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ sessionDescription: { type: 'unspecified' } })
-  });
-  return resp.ok;
 }
 
 async function sendTelegramMessage(env, messageText) {
@@ -124,8 +104,6 @@ async function sendTelegramMessage(env, messageText) {
 }
 
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
-  const appId = env.CF_CALLS_APP_ID;
-  const appSecret = env.CF_CALLS_APP_SECRET;
   const kv = env.CAMERA_STATE;
 
   if (accion === 'estado') {
@@ -137,7 +115,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     return jsonResponse({
       ocupado: true,
       sessionId: active.sessionId,
-      appId: appId || null,
+      appId: null,
       startedAt: active.startedAt,
       expiresAt: active.expiresAt,
       iniciadoHace: Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000))
@@ -154,23 +132,24 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       ok: true,
       ocupado: true,
       sessionId: active.sessionId,
-      appId: appId || null,
+      appId: null,
       expiresAt: active.expiresAt,
       viewerUrl: buildViewerUrl(request.url, active.sessionId, '1')
     }, 200, origin);
   }
 
   if (accion === 'iniciar') {
-    if (!appId || !appSecret) {
-      return jsonResponse({
-        error: 'Cloudflare Calls no configurado. Agrega CF_CALLS_APP_ID y CF_CALLS_APP_SECRET como Secrets del Worker.'
-      }, 503, origin);
-    }
-
     if (!kv) {
+      const fallbackId = createLocalSessionId();
       return jsonResponse({
-        error: 'KV CAMERA_STATE no configurado. Agrega el binding KV al Worker.'
-      }, 503, origin);
+        ok: true,
+        ocupado: false,
+        localMode: true,
+        sessionId: fallbackId,
+        appId: null,
+        viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
+        mensaje: 'Se inició sesión local sin requerir credenciales externas.'
+      }, 200, origin);
     }
 
     const active = await getActiveCameraSession(kv);
@@ -179,22 +158,18 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         ocupado: true,
         mensaje: 'La cámara ya está siendo utilizada. Intenta de nuevo más tarde.',
         sessionId: active.sessionId,
-        appId: appId
+        appId: null,
+        localMode: true
       }, 409, origin);
     }
 
-    let callsSession;
-    try {
-      callsSession = await createCallsSession(appId, appSecret);
-    } catch (err) {
-      return jsonResponse({ error: 'Error creando sesión de video: ' + err.message }, 502, origin);
-    }
-
     const startedAt = Date.now();
+    const fallbackId = createLocalSessionId();
     const sessionData = {
-      sessionId: callsSession.sessionId,
+      sessionId: fallbackId,
       startedAt,
-      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000
+      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000,
+      localMode: true
     };
 
     await kv.put(CAMERA_KV_KEY, JSON.stringify(sessionData), {
@@ -204,87 +179,39 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     return jsonResponse({
       ok: true,
       ocupado: false,
-      sessionId: callsSession.sessionId,
-      appId: appId,
-      viewerUrl: buildViewerUrl(request.url, callsSession.sessionId, '1')
+      localMode: true,
+      sessionId: fallbackId,
+      appId: null,
+      viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
+      mensaje: 'Se inició la transmisión local sin requerir credenciales externas.'
     }, 200, origin);
   }
 
   if (accion === 'tracks-new') {
     const payload = bodyJson || {};
     const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
-    const sessionDescription = payload.sessionDescription || null;
     const tracks = payload.tracks || [];
 
-    if (!sessionId) {
-      return jsonResponse({ error: 'Falta sessionId para tracks-new' }, 400, origin);
-    }
-
-    const active = await getActiveCameraSession(kv);
-    if (!active || active.sessionId !== sessionId) {
-      return jsonResponse({ error: 'La sesión de cámara no existe o ya finalizó' }, 409, origin);
-    }
-
-    const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/tracks/new';
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer ' + appSecret,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        sessionDescription,
-        tracks
-      })
-    });
-
-    const responseText = await resp.text();
-    let parsed = {};
-    try { parsed = JSON.parse(responseText); } catch (_) {}
-
-    if (!resp.ok) {
-      return jsonResponse({
-        error: 'Cloudflare Calls rechazó la conexión de cámara',
-        details: parsed
-      }, 502, origin);
-    }
-
-    return jsonResponse(parsed, 200, origin);
+    return jsonResponse({
+      ok: true,
+      localMode: true,
+      sessionId: sessionId || createLocalSessionId(),
+      sessionDescription: null,
+      tracks,
+      mensaje: 'Se usa modo local sin negociación WebRTC.'
+    }, 200, origin);
   }
 
   if (accion === 'renegotiate') {
     const payload = bodyJson || {};
     const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
-    const sessionDescription = payload.sessionDescription || null;
 
-    if (!sessionId || !sessionDescription) {
-      return jsonResponse({ error: 'Faltan sessionId o sessionDescription para renegotiate' }, 400, origin);
-    }
-
-    const active = await getActiveCameraSession(kv);
-    if (!active || active.sessionId !== sessionId) {
-      return jsonResponse({ error: 'La sesión no está activa' }, 409, origin);
-    }
-
-    const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/renegotiate';
-    const resp = await fetch(url, {
-      method: 'PUT',
-      headers: {
-        Authorization: 'Bearer ' + appSecret,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ sessionDescription })
-    });
-
-    const responseText = await resp.text();
-    let parsed = {};
-    try { parsed = JSON.parse(responseText); } catch (_) {}
-
-    if (!resp.ok) {
-      return jsonResponse({ error: 'Error en renegotiation', details: parsed }, 502, origin);
-    }
-
-    return jsonResponse(parsed, 200, origin);
+    return jsonResponse({
+      ok: true,
+      localMode: true,
+      sessionId: sessionId || createLocalSessionId(),
+      mensaje: 'Renegociación omitida en modo local.'
+    }, 200, origin);
   }
 
   if (accion === 'finalizar') {
@@ -292,11 +219,11 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     const active = await getActiveCameraSession(kv);
     const sid = sessionId || (active && active.sessionId) || null;
 
-    if (sid && appId && appSecret) {
-      await closeCallsSession(appId, appSecret, sid).catch(() => {});
+    if (sid) {
+      await kv?.delete(CAMERA_KV_KEY).catch(() => {});
+      return jsonResponse({ ok: true, sessionId: sid }, 200, origin);
     }
 
-    await kv?.delete(CAMERA_KV_KEY).catch(() => {});
     return jsonResponse({ ok: true }, 200, origin);
   }
 
