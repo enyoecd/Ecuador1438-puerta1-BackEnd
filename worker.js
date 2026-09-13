@@ -148,7 +148,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         sessionId: fallbackId,
         appId: null,
         viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
-        mensaje: 'Se inició sesión local sin requerir credenciales externas.'
+        mensaje: 'Transmisión local activa.'
       }, 200, origin);
     }
 
@@ -183,7 +183,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       sessionId: fallbackId,
       appId: null,
       viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
-      mensaje: 'Se inició la transmisión local sin requerir credenciales externas.'
+      mensaje: 'Transmisión local activa.'
     }, 200, origin);
   }
 
