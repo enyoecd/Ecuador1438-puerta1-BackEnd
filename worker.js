@@ -1,341 +1,531 @@
-export default {
-  async fetch(request, env) {
-    // ============================================================
-    // 1. CORS
-    // ============================================================
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    };
+const CAMERA_KV_KEY = 'puerta1_camera_session';
+const CAMERA_SESSION_TTL_SECONDS = 7200;
+const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+function corsHeaders(origin) {
+  return {
+    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400'
+  };
+}
+
+function jsonResponse(data, status = 200, origin = '*') {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      ...corsHeaders(origin)
+    }
+  });
+}
+
+function buildViewerUrl(requestUrl, sessionId, puerta = '1') {
+  const url = new URL('/viewer-p1.html', requestUrl);
+  url.searchParams.set('puerta', String(puerta));
+  if (sessionId) {
+    url.searchParams.set('sessionId', String(sessionId));
+  }
+  return url.toString();
+}
+
+function escapeHtml(value) {
+  const text = String(value ?? '');
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+async function getActiveCameraSession(kv) {
+  if (!kv) return null;
+  const raw = await kv.get(CAMERA_KV_KEY);
+  if (!raw) return null;
+
+  try {
+    const session = JSON.parse(raw);
+    if (!session || !session.sessionId) return null;
+    const now = Date.now();
+    if (session.expiresAt && now > session.expiresAt) {
+      await kv.delete(CAMERA_KV_KEY).catch(() => {});
+      return null;
+    }
+    return session;
+  } catch (_) {
+    await kv.delete(CAMERA_KV_KEY).catch(() => {});
+    return null;
+  }
+}
+
+async function createCallsSession(appId, appSecret) {
+  const url = CALLS_API_BASE + '/' + appId + '/sessions/new';
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + appSecret,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({})
+  });
+
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error('Calls API error ' + resp.status + ': ' + text);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    return { sessionId: text };
+  }
+}
+
+async function closeCallsSession(appId, appSecret, sessionId) {
+  if (!appId || !appSecret || !sessionId) return true;
+  const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/close';
+  const resp = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: 'Bearer ' + appSecret,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ sessionDescription: { type: 'unspecified' } })
+  });
+  return resp.ok;
+}
+
+async function sendTelegramMessage(env, messageText) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    throw new Error('Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en Cloudflare');
+  }
+
+  const url = 'https://api.telegram.org/bot' + env.TELEGRAM_BOT_TOKEN + '/sendMessage';
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      chat_id: env.TELEGRAM_CHAT_ID,
+      text: messageText,
+      parse_mode: 'HTML'
+    })
+  });
+
+  const result = await response.json();
+  if (!response.ok) {
+    throw new Error(JSON.stringify(result));
+  }
+
+  return result;
+}
+
+async function handleCamera(request, env, accion, formData, bodyJson, origin) {
+  const appId = env.CF_CALLS_APP_ID;
+  const appSecret = env.CF_CALLS_APP_SECRET;
+  const kv = env.CAMERA_STATE;
+
+  if (accion === 'estado') {
+    const active = await getActiveCameraSession(kv);
+    if (!active) {
+      return jsonResponse({ ocupado: false }, 200, origin);
     }
 
-    // ============================================================
-    // 2. Solo permitir POST
-    // ============================================================
-    if (request.method !== "POST") {
-      return new Response("Método no permitido", {
-        status: 405,
-        headers: corsHeaders
-      });
+    return jsonResponse({
+      ocupado: true,
+      sessionId: active.sessionId,
+      appId: appId || null,
+      startedAt: active.startedAt,
+      expiresAt: active.expiresAt,
+      iniciadoHace: Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000))
+    }, 200, origin);
+  }
+
+  if (accion === 'viewer') {
+    const active = await getActiveCameraSession(kv);
+    if (!active) {
+      return jsonResponse({ ocupado: false, mensaje: 'Sin sesión activa de cámara' }, 200, origin);
+    }
+
+    return jsonResponse({
+      ok: true,
+      ocupado: true,
+      sessionId: active.sessionId,
+      appId: appId || null,
+      expiresAt: active.expiresAt,
+      viewerUrl: buildViewerUrl(request.url, active.sessionId, '1')
+    }, 200, origin);
+  }
+
+  if (accion === 'iniciar') {
+    if (!appId || !appSecret) {
+      return jsonResponse({
+        error: 'Cloudflare Calls no configurado. Agrega CF_CALLS_APP_ID y CF_CALLS_APP_SECRET como Secrets del Worker.'
+      }, 503, origin);
+    }
+
+    if (!kv) {
+      return jsonResponse({
+        error: 'KV CAMERA_STATE no configurado. Agrega el binding KV al Worker.'
+      }, 503, origin);
+    }
+
+    const active = await getActiveCameraSession(kv);
+    if (active) {
+      return jsonResponse({
+        ocupado: true,
+        mensaje: 'La cámara ya está siendo utilizada. Intenta de nuevo más tarde.',
+        sessionId: active.sessionId,
+        appId: appId
+      }, 409, origin);
+    }
+
+    let callsSession;
+    try {
+      callsSession = await createCallsSession(appId, appSecret);
+    } catch (err) {
+      return jsonResponse({ error: 'Error creando sesión de video: ' + err.message }, 502, origin);
+    }
+
+    const startedAt = Date.now();
+    const sessionData = {
+      sessionId: callsSession.sessionId,
+      startedAt,
+      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000
+    };
+
+    await kv.put(CAMERA_KV_KEY, JSON.stringify(sessionData), {
+      expirationTtl: CAMERA_SESSION_TTL_SECONDS
+    });
+
+    return jsonResponse({
+      ok: true,
+      ocupado: false,
+      sessionId: callsSession.sessionId,
+      appId: appId,
+      viewerUrl: buildViewerUrl(request.url, callsSession.sessionId, '1')
+    }, 200, origin);
+  }
+
+  if (accion === 'tracks-new') {
+    const payload = bodyJson || {};
+    const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
+    const sessionDescription = payload.sessionDescription || null;
+    const tracks = payload.tracks || [];
+
+    if (!sessionId) {
+      return jsonResponse({ error: 'Falta sessionId para tracks-new' }, 400, origin);
+    }
+
+    const active = await getActiveCameraSession(kv);
+    if (!active || active.sessionId !== sessionId) {
+      return jsonResponse({ error: 'La sesión de cámara no existe o ya finalizó' }, 409, origin);
+    }
+
+    const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/tracks/new';
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + appSecret,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        sessionDescription,
+        tracks
+      })
+    });
+
+    const responseText = await resp.text();
+    let parsed = {};
+    try { parsed = JSON.parse(responseText); } catch (_) {}
+
+    if (!resp.ok) {
+      return jsonResponse({
+        error: 'Cloudflare Calls rechazó la conexión de cámara',
+        details: parsed
+      }, 502, origin);
+    }
+
+    return jsonResponse(parsed, 200, origin);
+  }
+
+  if (accion === 'renegotiate') {
+    const payload = bodyJson || {};
+    const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
+    const sessionDescription = payload.sessionDescription || null;
+
+    if (!sessionId || !sessionDescription) {
+      return jsonResponse({ error: 'Faltan sessionId o sessionDescription para renegotiate' }, 400, origin);
+    }
+
+    const active = await getActiveCameraSession(kv);
+    if (!active || active.sessionId !== sessionId) {
+      return jsonResponse({ error: 'La sesión no está activa' }, 409, origin);
+    }
+
+    const url = CALLS_API_BASE + '/' + appId + '/sessions/' + sessionId + '/renegotiate';
+    const resp = await fetch(url, {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Bearer ' + appSecret,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ sessionDescription })
+    });
+
+    const responseText = await resp.text();
+    let parsed = {};
+    try { parsed = JSON.parse(responseText); } catch (_) {}
+
+    if (!resp.ok) {
+      return jsonResponse({ error: 'Error en renegotiation', details: parsed }, 502, origin);
+    }
+
+    return jsonResponse(parsed, 200, origin);
+  }
+
+  if (accion === 'finalizar') {
+    const sessionId = (bodyJson && bodyJson.sessionId) || (formData && formData.get('sessionId')) || null;
+    const active = await getActiveCameraSession(kv);
+    const sid = sessionId || (active && active.sessionId) || null;
+
+    if (sid && appId && appSecret) {
+      await closeCallsSession(appId, appSecret, sid).catch(() => {});
+    }
+
+    await kv?.delete(CAMERA_KV_KEY).catch(() => {});
+    return jsonResponse({ ok: true }, 200, origin);
+  }
+
+  return jsonResponse({ error: 'Acción de cámara no reconocida' }, 400, origin);
+}
+
+async function handleFormulario(request, env, formData, bodyJson, origin) {
+  const nombre = (formData && formData.get('nombre')) || (bodyJson && bodyJson.nombre) || 'No especificado';
+  const email = (formData && formData.get('email')) || (bodyJson && bodyJson.email) || 'No especificado';
+  const telefono = (formData && formData.get('telefono')) || (bodyJson && bodyJson.telefono) || 'No especificado';
+  const motivo = (formData && formData.get('motivo')) || (bodyJson && bodyJson.motivo) || 'No especificado';
+  const mensaje = (formData && formData.get('mensaje')) || (bodyJson && bodyJson.mensaje) || 'Sin contenido';
+  const puerta = (formData && formData.get('puerta')) || (bodyJson && bodyJson.puerta) || 'Puerta 1';
+  const viewerUrl = (formData && formData.get('viewer_url')) || (bodyJson && bodyJson.viewer_url) || '';
+  const sessionId = (formData && formData.get('session_id')) || (bodyJson && bodyJson.session_id) || '';
+
+  let activeSessionId = sessionId || '';
+  if (!activeSessionId && env.CAMERA_STATE) {
+    const active = await getActiveCameraSession(env.CAMERA_STATE);
+    if (active && active.sessionId) {
+      activeSessionId = active.sessionId;
+    }
+  }
+
+  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1') : '');
+
+  const text = [
+    '🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽',
+    '',
+    '📩 NUEVO MENSAJE',
+    '',
+    '🏠 Puerta: ' + escapeHtml(puerta),
+    '👤 Nombre: ' + escapeHtml(nombre),
+    '📧 Email: ' + escapeHtml(email),
+    '📱 Teléfono: ' + escapeHtml(telefono),
+    '📌 Motivo: ' + escapeHtml(motivo),
+    '',
+    '💬 Mensaje:',
+    escapeHtml(mensaje),
+    ''
+  ];
+
+  if (baseViewerUrl) {
+    text.push('🔗 Ver transmisión: <a href="' + escapeHtml(baseViewerUrl) + '">Abrir visor de cámara</a>');
+  }
+
+  try {
+    const result = await sendTelegramMessage(env, text.join('\n'));
+    return jsonResponse({
+      success: true,
+      tipo: 'formulario',
+      viewer_url: baseViewerUrl,
+      result
+    }, 200, origin);
+  } catch (err) {
+    return jsonResponse({
+      success: false,
+      error: err.message || 'Error al enviar el formulario a Telegram',
+      tipo: 'formulario'
+    }, 500, origin);
+  }
+}
+
+async function handleTimbre(env, origin, bodyJson, formData) {
+  const now = Date.now();
+  const clave = 'puerta1_timbre';
+  const treintaMinutos = 30 * 60 * 1000;
+
+  let cantidad = 0;
+  let inicioBloqueo = null;
+
+  if (env.TIMBRE_KV) {
+    try {
+      const estado = await env.TIMBRE_KV.get(clave, 'json');
+      if (estado) {
+        cantidad = estado.cantidad || 0;
+        inicioBloqueo = estado.inicioBloqueo || null;
+      }
+    } catch (e) {
+      console.error('Error al leer de KV:', e);
+    }
+
+    if (inicioBloqueo) {
+      const transcurrido = now - inicioBloqueo;
+      if (transcurrido < treintaMinutos) {
+        const restanteMs = treintaMinutos - transcurrido;
+        const restanteMinutos = Math.ceil(restanteMs / 60000);
+        return jsonResponse({
+          success: false,
+          tipo: 'timbre',
+          bloqueado: true,
+          minutos_restantes: restanteMinutos,
+          error: 'Timbre bloqueado. Faltan ' + restanteMinutos + ' minutos para volver a utilizarlo.'
+        }, 429, origin);
+      }
+      cantidad = 0;
+      inicioBloqueo = null;
+    }
+
+    if (cantidad >= 3) {
+      return jsonResponse({
+        success: false,
+        tipo: 'timbre',
+        bloqueado: true,
+        minutos_restantes: 30,
+        error: 'Se alcanzó el límite de 3 toques. El timbre estará disponible nuevamente en 30 minutos.'
+      }, 429, origin);
+    }
+
+    cantidad += 1;
+    if (cantidad === 3) {
+      inicioBloqueo = now;
     }
 
     try {
-      // ==========================================================
-      // 3. Verificar Secrets de Telegram
-      // ==========================================================
-      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en Cloudflare"
-          }),
-          {
-            status: 500,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
-          }
-        );
+      await env.TIMBRE_KV.put(clave, JSON.stringify({ cantidad, inicioBloqueo }));
+    } catch (e) {
+      console.error('Error al guardar en KV:', e);
+    }
+  }
+
+  const textoTimbre = [
+    '🔔🔔🔔🔔🔔🔔🔔🔔🔔',
+    '',
+    '*🔔ESTÁN TOCANDO EL TIMBRE🔔*',
+    cantidad === 3 ? '\n⚠️ Se alcanzó el límite de 3 toques.\n⏳ Podrá volver a tocarse en 30 minutos.' : ''
+  ].join('\n');
+
+  try {
+    const telegramResponse = await sendTelegramMessage(env, textoTimbre);
+    return jsonResponse({
+      success: true,
+      tipo: 'timbre',
+      bloqueado: cantidad === 3,
+      toques_realizados: cantidad,
+      result: telegramResponse
+    }, 200, origin);
+  } catch (err) {
+    return jsonResponse({
+      success: false,
+      error: err.message || 'Error al enviar el timbre a Telegram',
+      tipo: 'timbre'
+    }, 500, origin);
+  }
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    const origin = request.headers.get('Origin') || '*';
+    const cors = corsHeaders(origin);
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
+    const url = new URL(request.url);
+    let tipo = url.searchParams.get('tipo') || '';
+    let accion = url.searchParams.get('accion') || '';
+
+    let formData = null;
+    let bodyJson = null;
+
+    if (request.method === 'POST' || request.method === 'PUT') {
+      const contentType = request.headers.get('Content-Type') || '';
+
+      if (contentType.includes('application/json')) {
+        try {
+          bodyJson = await request.json();
+        } catch (_) {}
       }
 
-      // ==========================================================
-      // 4. Detectar el tipo de contenido y extraer datos
-      // ==========================================================
-      const contentType = request.headers.get("content-type") || "";
+      if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
+        try {
+          formData = await request.formData();
+        } catch (_) {}
+      }
 
-      let tipo = "";
-      let nombre = "No especificado";
-      let email = "No especificado";
-      let telefono = "No especificado";
-      let mensajeUsuario = "Sin contenido";
-      let foto = null;
-
-      if (contentType.includes("multipart/form-data")) {
-        const formData = await request.formData();
-        tipo = formData.get("tipo") || "";
-        nombre = formData.get("nombre") || "No especificado";
-        email = formData.get("email") || "No especificado";
-        telefono = formData.get("telefono") || "No especificado";
-        mensajeUsuario = formData.get("mensaje") || "Sin contenido";
-
-        const archivo = formData.get("foto");
-        if (archivo instanceof File && archivo.size > 0) {
-          foto = archivo;
-        }
-      } else if (contentType.includes("application/json")) {
-        const data = await request.json();
-        tipo = data.tipo || "";
-        nombre = data.nombre || "No especificado";
-        email = data.email || "No especificado";
-        telefono = data.telefono || "No especificado";
-        mensajeUsuario = data.mensaje || "Sin contenido";
-      } else {
+      if (!bodyJson && !formData) {
         try {
           const text = await request.text();
-          const params = new URLSearchParams(text);
-          tipo = params.get("tipo") || "";
-          nombre = params.get("nombre") || "No especificado";
-          email = params.get("email") || "No especificado";
-          telefono = params.get("telefono") || "No especificado";
-          mensajeUsuario = params.get("mensaje") || "Sin contenido";
-        } catch (e) {}
-      }
-
-      // ==========================================================
-      // 5. SI ES UN TOQUE DE TIMBRE
-      // ==========================================================
-      if (tipo === "timbre") {
-        const ahora = Date.now();
-        const clave = "puerta1_timbre";
-        let cantidad = 0;
-        let inicioBloqueo = null;
-        const treintaMinutos = 30 * 60 * 1000;
-
-        // Si TIMBRE_KV está configurado en Cloudflare, gestionar límites
-        if (env.TIMBRE_KV) {
-          try {
-            const estado = await env.TIMBRE_KV.get(clave, "json");
-            if (estado) {
-              cantidad = estado.cantidad || 0;
-              inicioBloqueo = estado.inicioBloqueo || null;
-            }
-          } catch (e) {
-            console.error("Error al leer de KV:", e);
-          }
-
-          // Comprobar si todavía está dentro de los 30 minutos de bloqueo
-          if (inicioBloqueo) {
-            const transcurrido = ahora - inicioBloqueo;
-            if (transcurrido < treintaMinutos) {
-              const restanteMs = treintaMinutos - transcurrido;
-              const restanteMinutos = Math.ceil(restanteMs / 60000);
-
-              return new Response(
-                JSON.stringify({
-                  success: false,
-                  tipo: "timbre",
-                  bloqueado: true,
-                  minutos_restantes: restanteMinutos,
-                  error: `Timbre bloqueado. Faltan ${restanteMinutos} minutos para volver a utilizarlo.`
-                }),
-                {
-                  status: 429,
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...corsHeaders
-                  }
-                }
-              );
-            }
-            // Ya pasaron los 30 minutos. Reiniciar contador.
-            cantidad = 0;
-            inicioBloqueo = null;
-          }
-
-          // Seguridad: máximo 3 toques
-          if (cantidad >= 3) {
-            return new Response(
-              JSON.stringify({
-                success: false,
-                tipo: "timbre",
-                bloqueado: true,
-                minutos_restantes: 30,
-                error: "Se alcanzó el límite de 3 toques. El timbre estará disponible nuevamente en 30 minutos."
-              }),
-              {
-                status: 429,
-                headers: {
-                  "Content-Type": "application/json",
-                  ...corsHeaders
-                }
-              }
-            );
-          }
-
-          // Registrar el nuevo toque
-          cantidad++;
-          if (cantidad === 3) {
-            inicioBloqueo = ahora;
-          }
-
-          try {
-            await env.TIMBRE_KV.put(
-              clave,
-              JSON.stringify({
-                cantidad: cantidad,
-                inicioBloqueo: inicioBloqueo
-              })
-            );
-          } catch (e) {
-            console.error("Error al guardar en KV:", e);
-          }
-        } else {
-          // Si no está configurado TIMBRE_KV aún, enviar el mensaje sin bloquear la app
-          cantidad = 1;
-        }
-
-        // ========================================================
-        // Mensaje de Telegram formateado con campanitas
-        // ========================================================
-        let textoTimbre = `🔔🔔🔔🔔🔔🔔🔔🔔🔔\n\n*✅ESTÁN TOCANDO EL TIMBRE✅*`;
-
-        if (cantidad === 3) {
-          textoTimbre += `\n\n⚠️ Se alcanzó el límite de 3 toques.`;
-          textoTimbre += `\n⏳ Podrá volver a tocarse en 30 minutos.`;
-        }
-
-        const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-        const response = await fetch(telegramUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            chat_id: env.TELEGRAM_CHAT_ID,
-            text: textoTimbre,
-            parse_mode: "Markdown"
-          })
-        });
-
-        const telegramResult = await response.json();
-
-        if (!response.ok) {
-          return new Response(
-            JSON.stringify({
-              success: false,
-              error: "Error al enviar el timbre a Telegram",
-              telegram_status: response.status,
-              telegram_response: telegramResult
-            }),
-            {
-              status: 500,
-              headers: {
-                "Content-Type": "application/json",
-                ...corsHeaders
+          if (text) {
+            try {
+              bodyJson = JSON.parse(text);
+            } catch (_) {
+              const parsed = new URLSearchParams(text);
+              if (parsed.size) {
+                bodyJson = Object.fromEntries(parsed.entries());
               }
             }
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
-            success: true,
-            tipo: "timbre",
-            bloqueado: cantidad === 3,
-            toques_realizados: cantidad,
-            mensaje:
-              cantidad === 3
-                ? "Timbre sonando. Límite alcanzado. Disponible nuevamente en 30 minutos."
-                : "Timbre sonando."
-          }),
-          {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
           }
-        );
+        } catch (_) {}
       }
 
-      // ==========================================================
-      // 6. SI NO ES TIMBRE → FORMULARIO
-      // ==========================================================
-      const textoMensaje = `🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽
-
-📩 NUEVO MENSAJE
-
-👤 Nombre: ${nombre}
-
-📧 Email: ${email}
-
-📱 Teléfono: ${telefono}
-
-💬 Mensaje:
-
-${mensajeUsuario}`;
-
-      const telegramBaseUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
-      let response;
-
-      if (foto) {
-        const telegramForm = new FormData();
-        telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
-        telegramForm.append("caption", textoMensaje);
-        telegramForm.append("photo", foto, foto.name || "foto.jpg");
-
-        response = await fetch(`${telegramBaseUrl}/sendPhoto`, {
-          method: "POST",
-          body: telegramForm
-        });
-      } else {
-        response = await fetch(`${telegramBaseUrl}/sendMessage`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            chat_id: env.TELEGRAM_CHAT_ID,
-            text: textoMensaje
-          })
-        });
+      if (formData) {
+        tipo = tipo || formData.get('tipo') || '';
+        accion = accion || formData.get('accion') || '';
       }
-
-      const telegramResult = await response.json();
-
-      if (!response.ok) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Error al enviar el formulario a Telegram",
-            telegram_status: response.status,
-            telegram_response: telegramResult
-          }),
-          {
-            status: 500,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
-          }
-        );
+      if (bodyJson) {
+        tipo = tipo || bodyJson.tipo || '';
+        accion = accion || bodyJson.accion || '';
       }
-
-      return new Response(
-        JSON.stringify({
-          success: true,
-          tipo: "formulario",
-          result: telegramResult
-        }),
-        {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders
-          }
-        }
-      );
-
-    } catch (error) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: error.message
-        }),
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders
-          }
-        }
-      );
     }
+
+    if (request.method === 'GET') {
+      tipo = tipo || url.searchParams.get('tipo') || '';
+      accion = accion || url.searchParams.get('accion') || '';
+    }
+
+    if (tipo === 'camara') {
+      return handleCamera(request, env, accion, formData, bodyJson, origin);
+    }
+
+    if (tipo === 'timbre') {
+      return handleTimbre(env, origin, bodyJson, formData);
+    }
+
+    if (tipo === 'formulario') {
+      return handleFormulario(request, env, formData, bodyJson, origin);
+    }
+
+    if (request.method === 'GET') {
+      return jsonResponse({
+        ok: true,
+        mensaje: 'Worker activo',
+        tipo,
+        accion
+      }, 200, origin);
+    }
+
+    return jsonResponse({ error: 'Solicitud no reconocida' }, 400, origin);
   }
 };
