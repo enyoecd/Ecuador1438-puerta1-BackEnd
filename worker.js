@@ -13,6 +13,7 @@
 //                                            el enlace del visor a Telegram
 //    POST tipo=camara (accion=tracks-new) → publica/suscribe tracks en el SFU
 //    POST tipo=camara (accion=renegotiate)→ responde a renegociación del SFU
+//    POST tipo=camara (accion=latido)     → renueva el lease del emisor activo
 //    POST tipo=camara (accion=finalizar)  → cierra la sesión del publicador
 //    POST tipo=camara (accion=finalizar-viewer) → cierra sesión del visor
 //    POST tipo=camara (accion=viewer)     → prepara sesión para el visor
@@ -29,7 +30,18 @@
 // ═══════════════════════════════════════════════════════════════
 
 const CAMERA_KV_KEY = 'puerta1_camera_session';
-const CAMERA_SESSION_TTL_SECONDS = 7200; // 2 horas máximo
+// Tope duro de vida útil de la sesión: las transmisiones duran máximo 5:00 y a
+// eso se le suma el cooldown de 1 min, así que una sesión real nunca pasa de 6
+// minutos. Este límite solo actúa como red de seguridad si el lease (1 min,
+// renovado por "latido") no se pudiera limpiar por un fallo.
+const CAMERA_SESSION_TTL_SECONDS = 6 * 60;
+// Lease renovable por el emisor mientras transmite. Si la página se cierra sin
+// avisar, este lease expira y el estado "en uso" se libera solo (sin bloqueo
+// fantasma). El emisor renueva cada ~20 s con la acción "latido".
+const CAMERA_LEASE_MS = 60 * 1000;
+// TTL con el que se escriben/renuevan las claves en KV (un poco mayor que el
+// lease para que KV limpie solo los restos).
+const CAMERA_KV_EXPIRATION_TTL = 180;
 const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
 const CALLS_CLOSE_PATH = '/close';
 
@@ -57,6 +69,10 @@ async function getCameraSession(env) {
   }
 
   const now = Date.now();
+  // `expiresAt` es un lease corto renovado por el emisor (latido); si expiró,
+  // la sesión se considera libre y se limpia. Como respaldo duro también se
+  // valida contra el límite absoluto de 6 minutos desde el inicio (máximo real
+  // de una transmisión: 5:00 + cooldown de 1 min).
   if (
     !session ||
     !session.sessionId ||
@@ -73,7 +89,7 @@ async function setCameraSession(env, data) {
   const value = JSON.stringify(data);
   if (env.CAMERA_STATE) {
     await env.CAMERA_STATE.put(CAMERA_KV_KEY, value, {
-      expirationTtl: CAMERA_SESSION_TTL_SECONDS
+      expirationTtl: CAMERA_KV_EXPIRATION_TTL
     }).catch(() => {});
   } else {
     memoStore.set(CAMERA_KV_KEY, value);
@@ -273,7 +289,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     await setCameraSession(env, {
       sessionId,
       startedAt,
-      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000,
+      expiresAt: startedAt + CAMERA_LEASE_MS,
       tracks: [],
       telegramSent: false
     });
@@ -343,7 +359,8 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       });
 
       const tracks = Array.isArray(payload.tracks) ? payload.tracks : [];
-      const isPush = tracks.some((t) => (t.location || '') === 'local');
+      const localTracks = tracks.filter((t) => (t.location || '') === 'local');
+      const isPush = localTracks.length > 0;
 
       // El publicador acaba de conectar su cámara al SFU:
       // guardar tracks publicados y enviar automáticamente a Telegram
@@ -351,9 +368,26 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       // abra el enlace desde el chat y vea el streaming en vivo.
       const active = await getCameraSession(env);
       if (active && sessionId === active.sessionId) {
-        if (Array.isArray(result.tracks) && result.tracks.length) {
+        if (isPush) {
+          // Reconstruir la lista de tracks publicados garantizando que el visor
+          // reciba SIEMPRE video y audio. Evita que una respuesta incompleta del
+          // SFU (solo audio) deje el video en negro en el visor.
+          const porNombre = {};
+          (Array.isArray(active.tracks) ? active.tracks : [])
+            .concat(localTracks)
+            .forEach(function (t) {
+              if (t && t.trackName && t.mid) porNombre[t.trackName] = t;
+            });
+          ['video', 'audio'].forEach(function (n) {
+            if (!porNombre[n]) porNombre[n] = { location: 'local', mid: String(n), trackName: n };
+          });
+          active.tracks = Object.keys(porNombre).map(function (n) { return porNombre[n]; });
+        } else if (Array.isArray(result.tracks) && result.tracks.length) {
           active.tracks = result.tracks;
         }
+        // Cualquier actividad del emisor renueva el lease de la sesión.
+        active.expiresAt = Date.now() + CAMERA_LEASE_MS;
+
         if (isPush) {
           let telegramEnviado = false;
           let telegramError = null;
@@ -399,6 +433,26 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     } catch (err) {
       return jsonResponse({ error: err.message }, 502, origin);
     }
+  }
+
+  // ── LATIDO (heartbeat del emisor) ──────────────────────────────
+  // Renueva el lease corto de la sesión mientras la página emisora sigue
+  // transmitiendo. Si el emisor desaparece (cierra la pestaña o cae sin avisar),
+  // el lease expira y "estado" deja de reportar "ocupado".
+  if (accion === 'latido') {
+    const active = await getCameraSession(env);
+    if (!active) {
+      return jsonResponse({ ok: true, ocupado: false }, 200, origin);
+    }
+    const sid =
+      (bodyJson && bodyJson.sessionId) ||
+      (formData && formData.get('sessionId')) || null;
+    if (!sid || sid !== active.sessionId) {
+      return jsonResponse({ ok: true, ocupado: false }, 200, origin);
+    }
+    active.expiresAt = Date.now() + CAMERA_LEASE_MS;
+    await setCameraSession(env, active);
+    return jsonResponse({ ok: true, ocupado: true }, 200, origin);
   }
 
   // ── FINALIZAR PUBLICADOR (POST) ───────────────────────────────
