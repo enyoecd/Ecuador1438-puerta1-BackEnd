@@ -108,11 +108,14 @@ async function deleteCameraSession(env) {
 //  HELPERS HTTP
 // ═══════════════════════════════════════════════════════════════
 function corsHeaders(origin) {
+  // Responder con el Origin recibido cuando sea posible y marcar Vary: Origin
+  // para evitar respuestas cacheadas con un Access-Control-Allow-Origin incorrecto.
   return {
     'Access-Control-Allow-Origin': origin || '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Max-Age': '86400'
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin'
   };
 }
 
