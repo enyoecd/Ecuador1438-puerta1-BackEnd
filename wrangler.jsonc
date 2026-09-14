@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "puerta1-ecuador1438",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-09",
+
+  // ────────── Cámara / Cloudflare Calls SFU ──────────────────────
+  //
+  // 1) Secrets (NO van en este archivo; cárgalos con la CLI o el dashboard):
+  //      wrangler secret put ID_app
+  //      wrangler secret put Token_API
+  //    ID_app     → App ID de Cloudflare Calls (Realtime SFU)
+  //    Token_API  → Token de la app de Cloudflare Calls
+  //    (TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID ya existen en Cloudflare)
+  //
+  // 2) URL base pública del frontend. El Worker la usa para construir
+  //    el enlace del visor (viewer-p1.html) que se envía a Telegram.
+  "vars": {
+    "VIEWER_BASE_URL": "https://enyoecd.github.io/Ecuador1438"
+  }
+
+  // 3) KV opcional (recomendado) para estado de cámara y límites de timbre:
+  //    "kv_namespaces": [
+  //      { "binding": "CAMERA_STATE", "id": "ID_NAMESPACE_CAMARA" },
+  //      { "binding": "TIMBRE_KV",    "id": "ID_NAMESPACE_TIMBRE" }
+  //    ]
+}
