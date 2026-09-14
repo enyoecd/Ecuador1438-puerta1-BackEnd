@@ -224,7 +224,7 @@ async function closeCallsSession(cfg, sessionId) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  HANDLER CÁMARA
+//  HANDLER CÁMARA.
 // ═══════════════════════════════════════════════════════════════
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   const cfg = callsConfig(env);
