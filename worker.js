@@ -284,6 +284,36 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     return jsonResponse(responseBody, 200, origin);
   }
 
+  if (accion === 'enviar-enlace') {
+    const active = await getActiveCameraSession(kv);
+    if (!active || !active.sessionId) {
+      return jsonResponse({ success: false, error: 'Sin sesión activa de cámara' }, 200, origin);
+    }
+
+    const viewerUrl = buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken, env.VIEWER_BASE_URL);
+
+    // Mensaje independiente del timbre: solo el enlace público del visor.
+    let telegramEnviado = false;
+    let telegramError = null;
+    try {
+      await sendTelegramMessage(
+        env,
+        '<a href="' + escapeHtml(viewerUrl) + '">🎥 Ver transmisión en directo</a>'
+      );
+      telegramEnviado = true;
+    } catch (err) {
+      telegramError = err.message || 'Error al enviar a Telegram';
+      console.error('Error al enviar el enlace del visor a Telegram:', telegramError);
+    }
+
+    return jsonResponse({
+      success: true,
+      viewerUrl,
+      telegramEnviado,
+      telegramError
+    }, 200, origin);
+  }
+
   if (accion === 'viewer') {
     const active = await getActiveCameraSession(kv);
     if (!active) {

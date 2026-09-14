@@ -66,6 +66,7 @@ Todo el signaling pasa por el Worker (el secret nunca viaja al navegador):
 | --- | --- | --- | --- |
 | `estado` | GET | `?tipo=camara&accion=estado` | ¿Hay sesión activa? (para polling del botón) |
 | `iniciar` | POST | `tipo=camara&accion=iniciar` | Crea sesión SFU, reserva KV, devuelve `sessionId`+`viewerToken` |
+| `enviar-enlace` | POST | `tipo=camara&accion=enviar-enlace` | Envía a Telegram solo la URL pública del visor de la sesión activa |
 | `viewer` | POST | `tipo=camara&accion=viewer` + `token` | Crea sesión SFU del viewer, devuelve `viewerSessionId`+`sourceTracks` |
 | `tracks-new` | POST | JSON `{sessionId, sessionDescription?, tracks}` | Proxy a Calls (`tracks/new`) |
 | `renegotiate` | POST | JSON `{sessionId, sessionDescription}` | Proxy a Calls (`renegotiate`) |
