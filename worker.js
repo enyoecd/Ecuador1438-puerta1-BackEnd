@@ -110,8 +110,8 @@ async function sendTelegramMessage(env, messageText) {
 }
 
 function callsConfig(env) {
-  const appId = env.CF_CALLS_APP_ID;
-  const appSecret = env.CF_CALLS_APP_SECRET;
+  const appId = env.ID_app;
+  const appSecret = env.Token_API;
   if (!appId || !appSecret) return null;
   return {
     appId,
@@ -172,12 +172,30 @@ async function callsRenegotiate(cfg, sessionId, sessionDescription) {
   return resp.json().catch(() => ({}));
 }
 
+async function callsGetSession(cfg, sessionId) {
+  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId, {
+    method: 'GET',
+    headers: cfg.headers
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error('Calls get session falló (' + resp.status + '): ' + JSON.stringify(data));
+  }
+  return data;
+}
+
 async function closeCallsSession(cfg, sessionId) {
   if (!cfg || !sessionId) return;
+  // El SFU cierra la sesión automáticamente al terminar el PeerConnection.
+  // Estos intentos son best-effort por compatibilidad con variantes v1.
   await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId + CALLS_CLOSE_PATH, {
     method: 'PUT',
     headers: cfg.headers,
-    body: JSON.stringify({ sessionDescription: { type: 'unspecified' } })
+    body: JSON.stringify({ sessionDescription: { type: 'unspecified', sdp: '' } })
+  }).catch(() => {});
+  await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId, {
+    method: 'DELETE',
+    headers: cfg.headers
   }).catch(() => {});
 }
 
@@ -347,13 +365,30 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       return jsonResponse({ error: err.message }, 502, origin);
     }
 
+    let sourceTracks = Array.isArray(active.tracks)
+      ? active.tracks
+          .filter((t) => t && t.trackName)
+          .map((t) => ({ trackName: t.trackName, mid: t.mid || null }))
+      : [];
+    if (!sourceTracks.length) {
+      try {
+        const sessionState = await callsGetSession(cfg, active.sessionId);
+        const liveTracks = (sessionState && sessionState.tracks) || [];
+        sourceTracks = liveTracks
+          .filter((t) => t && t.location === 'local' && t.trackName && t.status !== 'inactive')
+          .map((t) => ({ trackName: t.trackName, mid: t.mid || null }));
+      } catch (_) {
+        // Sin tracks todavía: el viewer reintentará con sourceTracks vacíos.
+      }
+    }
+
     return jsonResponse({
       ok: true,
       ocupado: true,
       sourceSessionId: active.sessionId,
       viewerSessionId,
       appId: cfg.appId,
-      sourceTracks: active.tracks || [],
+      sourceTracks,
       expiresAt: active.expiresAt,
       viewerUrl: buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken, env.VIEWER_BASE_URL)
     }, 200, origin);
@@ -454,7 +489,9 @@ async function handleFormulario(request, env, formData, bodyJson, origin) {
 
   const active = env.CAMERA_STATE ? await getActiveCameraSession(env.CAMERA_STATE) : null;
   const tokenForUrl = active && active.viewerToken ? active.viewerToken : null;
-  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1', tokenForUrl, env.VIEWER_BASE_URL) : '');
+  const baseViewerUrl = active && active.sessionId
+    ? buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken || tokenForUrl, env.VIEWER_BASE_URL)
+    : (viewerUrl || '');
 
   const text = [
     '🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽',

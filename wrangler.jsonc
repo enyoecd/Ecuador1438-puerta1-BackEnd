@@ -14,8 +14,8 @@
   // ]
 
   // 2) Secrets (NO van en este archivo; cárgalos con CLI o dashboard):
-  //    wrangler secret put CF_CALLS_APP_ID
-  //    wrangler secret put CF_CALLS_APP_SECRET
+  //    wrangler secret put ID_app      # App ID del Calls SFU (puerta1-ecuador1438-sfu)
+  //    wrangler secret put Token_API   # App Secret / Token del Calls SFU
   //    (TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID ya deberían existir)
 
   // 3) URL pública donde se hostea el frontend (viewer-p1.html).

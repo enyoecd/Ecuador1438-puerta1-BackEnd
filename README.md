@@ -15,10 +15,11 @@ Configúralo una sola vez:
 
 ### 1. Crear la app Calls
 
-Dashboard Cloudflare → **Realtime → Calls SFU → Create App**. Anota:
+Dashboard Cloudflare → **Realtime → Calls SFU → Create App** (nombre sugerido:
+`puerta1-ecuador1438-sfu`). Anota:
 
-- **App ID** → será el secret `CF_CALLS_APP_ID`
-- **App Secret** → será el secret `CF_CALLS_APP_SECRET`
+- **App ID** → será el secret `ID_app`
+- **App Secret** → será el secret `Token_API`
 
 ### 2. Namespaces KV
 
@@ -34,8 +35,8 @@ Dashboard → Worker → Settings → Variables → KV Namespace Bindings:
 ### 3. Secrets
 
 ```bash
-npx wrangler secret put CF_CALLS_APP_ID    # el App ID del paso 1
-npx wrangler secret put CF_CALLS_APP_SECRET # el App Secret del paso 1
+npx wrangler secret put ID_app      # App ID del Calls SFU (puerta1-ecuador1438-sfu)
+npx wrangler secret put Token_API   # App Secret / Token del Calls SFU
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 ```
