@@ -1,5 +1,7 @@
 const CAMERA_KV_KEY = 'puerta1_camera_session';
 const CAMERA_SESSION_TTL_SECONDS = 7200;
+const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
+const CALLS_CLOSE_PATH = '/close';
 function corsHeaders(origin) {
   return {
     'Access-Control-Allow-Origin': origin || '*',
@@ -19,8 +21,9 @@ function jsonResponse(data, status = 200, origin = '*') {
   });
 }
 
-function buildViewerUrl(requestUrl, sessionId, puerta = '1', token = null) {
-  const url = new URL('/viewer-p1.html', requestUrl);
+function buildViewerUrl(requestUrl, sessionId, puerta = '1', token = null, viewerBase = null) {
+  const base = viewerBase || requestUrl;
+  const url = new URL('/viewer-p1.html', base);
   url.searchParams.set('puerta', String(puerta));
   if (sessionId) {
     url.searchParams.set('sessionId', String(sessionId));
@@ -106,6 +109,90 @@ async function sendTelegramMessage(env, messageText) {
   return result;
 }
 
+function callsConfig(env) {
+  const appId = env.CF_CALLS_APP_ID;
+  const appSecret = env.CF_CALLS_APP_SECRET;
+  if (!appId || !appSecret) return null;
+  return {
+    appId,
+    headers: {
+      Authorization: 'Bearer ' + appSecret,
+      'Content-Type': 'application/json'
+    }
+  };
+}
+
+function createRandomToken() {
+  try {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+  } catch (_) {}
+  return 'vt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+async function callsNewSession(cfg) {
+  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/new', {
+    method: 'POST',
+    headers: cfg.headers,
+    body: '{}'
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.sessionId) {
+    throw new Error('Calls crear sesión falló (' + resp.status + '): ' + JSON.stringify(data));
+  }
+  return data.sessionId;
+}
+
+async function callsTracksNew(cfg, sessionId, body) {
+  const payload = { tracks: Array.isArray(body.tracks) ? body.tracks : [] };
+  if (body.sessionDescription) payload.sessionDescription = body.sessionDescription;
+  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId + '/tracks/new', {
+    method: 'POST',
+    headers: cfg.headers,
+    body: JSON.stringify(payload)
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error('Calls tracks/new falló (' + resp.status + '): ' + JSON.stringify(data));
+  }
+  return data;
+}
+
+async function callsRenegotiate(cfg, sessionId, sessionDescription) {
+  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId + '/renegotiate', {
+    method: 'PUT',
+    headers: cfg.headers,
+    body: JSON.stringify({ sessionDescription })
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error('Calls renegotiate falló (' + resp.status + '): ' + text);
+  }
+  return resp.json().catch(() => ({}));
+}
+
+async function closeCallsSession(cfg, sessionId) {
+  if (!cfg || !sessionId) return;
+  await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId + CALLS_CLOSE_PATH, {
+    method: 'PUT',
+    headers: cfg.headers,
+    body: JSON.stringify({ sessionDescription: { type: 'unspecified' } })
+  }).catch(() => {});
+}
+
+function localModeResponse(sessionId, origin) {
+  return jsonResponse({
+    ok: true,
+    localMode: true,
+    sessionId: sessionId || createLocalSessionId(),
+    appId: null,
+    sessionDescription: null,
+    tracks: [],
+    mensaje: 'Se usa modo local sin negociación WebRTC.'
+  }, 200, origin);
+}
+
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   const kv = env.CAMERA_STATE;
 
@@ -130,22 +217,71 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       return jsonResponse({ ocupado: false }, 200, origin);
     }
 
-    // If a viewer token is set for the active session, require the token to allow status details
-    if (active.viewerToken) {
-      const token = extractToken();
-      if (!token || token !== active.viewerToken) {
-        return jsonResponse({ error: 'invalid_token' }, 401, origin);
-      }
-    }
-
     return jsonResponse({
       ocupado: true,
-      sessionId: active.sessionId,
-      appId: null,
-      startedAt: active.startedAt,
-      expiresAt: active.expiresAt,
-      iniciadoHace: Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000))
+      iniciadoHace: Math.max(0, Math.floor((Date.now() - active.startedAt) / 1000)),
+      modo: active.mode || (callsConfig(env) ? 'sfu' : 'local')
     }, 200, origin);
+  }
+
+  if (accion === 'iniciar') {
+    const active = await getActiveCameraSession(kv);
+    if (active) {
+      return jsonResponse({
+        ocupado: true,
+        mensaje: 'La cámara ya está siendo utilizada. Intenta de nuevo más tarde.',
+        sessionId: active.sessionId,
+        appId: callsConfig(env) ? callsConfig(env).appId : null,
+        localMode: (active.mode !== 'sfu')
+      }, 409, origin);
+    }
+
+    const startedAt = Date.now();
+    const viewerToken = createRandomToken();
+    const cfg = callsConfig(env);
+
+    let sessionId;
+    let mode;
+    if (cfg) {
+      try {
+        sessionId = await callsNewSession(cfg);
+        mode = 'sfu';
+      } catch (err) {
+        return jsonResponse({ error: err.message }, 502, origin);
+      }
+    } else {
+      sessionId = createLocalSessionId();
+      mode = 'local';
+    }
+
+    const sessionData = {
+      sessionId,
+      startedAt,
+      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000,
+      mode,
+      viewerToken,
+      tracks: []
+    };
+
+    if (kv) {
+      await kv.put(CAMERA_KV_KEY, JSON.stringify(sessionData), {
+        expirationTtl: CAMERA_SESSION_TTL_SECONDS
+      }).catch(() => {});
+    }
+
+    const responseBody = {
+      ok: true,
+      ocupado: false,
+      sessionId,
+      appId: cfg ? cfg.appId : null,
+      viewerToken,
+      viewerUrl: buildViewerUrl(request.url, sessionId, '1', viewerToken, env.VIEWER_BASE_URL)
+    };
+    if (mode === 'local') {
+      responseBody.localMode = true;
+      responseBody.mensaje = 'Transmisión local activa.';
+    }
+    return jsonResponse(responseBody, 200, origin);
   }
 
   if (accion === 'viewer') {
@@ -162,105 +298,87 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       }
     }
 
-    return jsonResponse({
-      ok: true,
-      ocupado: true,
-      sessionId: active.sessionId,
-      appId: null,
-      expiresAt: active.expiresAt,
-      viewerUrl: buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken)
-    }, 200, origin);
-  }
-
-  if (accion === 'iniciar') {
-    if (!kv) {
-      const fallbackId = createLocalSessionId();
+    const cfg = callsConfig(env);
+    if (!cfg || active.mode !== 'sfu') {
       return jsonResponse({
         ok: true,
-        ocupado: false,
-        localMode: true,
-        sessionId: fallbackId,
+        ocupado: true,
+        sessionId: active.sessionId,
         appId: null,
-        viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
-        mensaje: 'Transmisión local activa.'
+        localMode: true,
+        viewerUrl: buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken, env.VIEWER_BASE_URL)
       }, 200, origin);
     }
 
-    const active = await getActiveCameraSession(kv);
-    if (active) {
-      return jsonResponse({
-        ocupado: true,
-        mensaje: 'La cámara ya está siendo utilizada. Intenta de nuevo más tarde.',
-        sessionId: active.sessionId,
-        appId: null,
-        localMode: true
-      }, 409, origin);
-    }
-
-    const startedAt = Date.now();
-    const fallbackId = createLocalSessionId();
-
-    // generate a viewer token for this session (for viewer links)
-    let viewerToken = null;
+    let viewerSessionId;
     try {
-      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-        viewerToken = crypto.randomUUID();
-      } else {
-        viewerToken = 'vt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
-      }
-    } catch (_) {
-      viewerToken = 'vt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+      viewerSessionId = await callsNewSession(cfg);
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 502, origin);
     }
-
-    const sessionData = {
-      sessionId: fallbackId,
-      startedAt,
-      expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000,
-      localMode: true,
-      viewerToken: viewerToken
-    };
-
-    await kv.put(CAMERA_KV_KEY, JSON.stringify(sessionData), {
-      expirationTtl: CAMERA_SESSION_TTL_SECONDS
-    });
 
     return jsonResponse({
       ok: true,
-      ocupado: false,
-      localMode: true,
-      sessionId: fallbackId,
-      appId: null,
-      viewerUrl: buildViewerUrl(request.url, fallbackId, '1', viewerToken),
-      viewerToken: viewerToken,
-      mensaje: 'Transmisión local activa.'
+      ocupado: true,
+      sourceSessionId: active.sessionId,
+      viewerSessionId,
+      appId: cfg.appId,
+      sourceTracks: active.tracks || [],
+      expiresAt: active.expiresAt,
+      viewerUrl: buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken, env.VIEWER_BASE_URL)
     }, 200, origin);
   }
 
   if (accion === 'tracks-new') {
+    const cfg = callsConfig(env);
     const payload = bodyJson || {};
     const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
-    const tracks = payload.tracks || [];
+    const tracks = Array.isArray(payload.tracks) ? payload.tracks : [];
+    const sessionDescription = payload.sessionDescription || null;
 
-    return jsonResponse({
-      ok: true,
-      localMode: true,
-      sessionId: sessionId || createLocalSessionId(),
-      sessionDescription: null,
-      tracks,
-      mensaje: 'Se usa modo local sin negociación WebRTC.'
-    }, 200, origin);
+    if (!cfg || !sessionId) {
+      return localModeResponse(sessionId, origin);
+    }
+
+    try {
+      const result = await callsTracksNew(cfg, sessionId, { tracks, sessionDescription });
+
+      const active = await getActiveCameraSession(kv);
+      const isPush = tracks.some((t) => (t.location || '') === 'local');
+      if (kv && active && isPush && sessionId === active.sessionId && Array.isArray(result.tracks)) {
+        active.tracks = result.tracks;
+        await kv.put(CAMERA_KV_KEY, JSON.stringify(active), {
+          expirationTtl: CAMERA_SESSION_TTL_SECONDS
+        }).catch(() => {});
+      }
+
+      return jsonResponse(result, 200, origin);
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 502, origin);
+    }
   }
 
   if (accion === 'renegotiate') {
+    const cfg = callsConfig(env);
     const payload = bodyJson || {};
     const sessionId = payload.sessionId || (formData && formData.get('sessionId')) || null;
+    const sessionDescription = payload.sessionDescription || null;
 
-    return jsonResponse({
-      ok: true,
-      localMode: true,
-      sessionId: sessionId || createLocalSessionId(),
-      mensaje: 'Renegociación omitida en modo local.'
-    }, 200, origin);
+    if (!cfg || !sessionId || !sessionDescription) {
+      return jsonResponse({
+        ok: true,
+        localMode: true,
+        sessionId: sessionId || createLocalSessionId(),
+        mensaje: 'Renegociación omitida en modo local.'
+      }, 200, origin);
+    }
+
+    try {
+      await callsRenegotiate(cfg, sessionId, sessionDescription);
+      return jsonResponse({ ok: true, sessionId }, 200, origin);
+    } catch (err) {
+      return jsonResponse({ error: err.message }, 502, origin);
+    }
   }
 
   if (accion === 'finalizar') {
@@ -269,11 +387,18 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     const sid = sessionId || (active && active.sessionId) || null;
 
     if (sid) {
+      await closeCallsSession(callsConfig(env), sid);
       await kv?.delete(CAMERA_KV_KEY).catch(() => {});
       return jsonResponse({ ok: true, sessionId: sid }, 200, origin);
     }
 
     return jsonResponse({ ok: true }, 200, origin);
+  }
+
+  if (accion === 'finalizar-viewer') {
+    const sessionId = (bodyJson && bodyJson.sessionId) || (formData && formData.get('sessionId')) || null;
+    await closeCallsSession(callsConfig(env), sessionId);
+    return jsonResponse({ ok: true, sessionId }, 200, origin);
   }
 
   return jsonResponse({ error: 'Acción de cámara no reconocida' }, 400, origin);
@@ -299,7 +424,7 @@ async function handleFormulario(request, env, formData, bodyJson, origin) {
 
   const active = env.CAMERA_STATE ? await getActiveCameraSession(env.CAMERA_STATE) : null;
   const tokenForUrl = active && active.viewerToken ? active.viewerToken : null;
-  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1', tokenForUrl) : '');
+  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1', tokenForUrl, env.VIEWER_BASE_URL) : '');
 
   const text = [
     '🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽',

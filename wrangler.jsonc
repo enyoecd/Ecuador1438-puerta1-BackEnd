@@ -2,5 +2,26 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "puerta1-ecuador1438",
   "main": "worker.js",
-  "compatibility_date": "2026-09-09"
+  "compatibility_date": "2026-09-09",
+
+  // ── Cámara (Cloudflare Calls SFU) ──────────────────────────────
+  // 1) Crea un Namespace KV (dashboard: Workers & Pages → KV) y
+  //    descomenta el binding con el ID del namespace:
+  //
+  // "kv_namespaces": [
+  //   { "binding": "CAMERA_STATE", "id": "EL_NAMESPACE_ID" },
+  //   { "binding": "TIMBRE_KV",    "id": "EL_NAMESPACE_ID_DEL_TIMBRE" }
+  // ]
+
+  // 2) Secrets (NO van en este archivo; cárgalos con CLI o dashboard):
+  //    wrangler secret put CF_CALLS_APP_ID
+  //    wrangler secret put CF_CALLS_APP_SECRET
+  //    (TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID ya deberían existir)
+
+  // 3) URL pública donde se hostea el frontend (viewer-p1.html).
+  //    Si el frontend se sirve desde este mismo Worker (wrangler assets),
+  //    puedes omitirlo. Si usas GitHub Pages / Vercel / Netlify u otro host,
+  //    define la base para que los enlaces "Ver transmisión" apunten ahí:
+  //
+  // "vars": { "VIEWER_BASE_URL": "https://TU-DOMINIO-PUBLICO" }
 }
