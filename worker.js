@@ -19,11 +19,14 @@ function jsonResponse(data, status = 200, origin = '*') {
   });
 }
 
-function buildViewerUrl(requestUrl, sessionId, puerta = '1') {
+function buildViewerUrl(requestUrl, sessionId, puerta = '1', token = null) {
   const url = new URL('/viewer-p1.html', requestUrl);
   url.searchParams.set('puerta', String(puerta));
   if (sessionId) {
     url.searchParams.set('sessionId', String(sessionId));
+  }
+  if (token) {
+    url.searchParams.set('token', String(token));
   }
   return url.toString();
 }
@@ -106,10 +109,33 @@ async function sendTelegramMessage(env, messageText) {
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   const kv = env.CAMERA_STATE;
 
+  // helper to extract token from query/form/body
+  function extractToken() {
+    try {
+      const url = new URL(request.url);
+      const q = url.searchParams.get('token');
+      if (q) return q;
+    } catch (_) {}
+    if (formData && formData.get) {
+      const t = formData.get('token');
+      if (t) return t;
+    }
+    if (bodyJson && bodyJson.token) return bodyJson.token;
+    return null;
+  }
+
   if (accion === 'estado') {
     const active = await getActiveCameraSession(kv);
     if (!active) {
       return jsonResponse({ ocupado: false }, 200, origin);
+    }
+
+    // If a viewer token is set for the active session, require the token to allow status details
+    if (active.viewerToken) {
+      const token = extractToken();
+      if (!token || token !== active.viewerToken) {
+        return jsonResponse({ error: 'invalid_token' }, 401, origin);
+      }
     }
 
     return jsonResponse({
@@ -128,13 +154,21 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       return jsonResponse({ ocupado: false, mensaje: 'Sin sesión activa de cámara' }, 200, origin);
     }
 
+    // Require token for viewer initialization if session has viewerToken
+    if (active.viewerToken) {
+      const token = extractToken();
+      if (!token || token !== active.viewerToken) {
+        return jsonResponse({ error: 'invalid_token' }, 401, origin);
+      }
+    }
+
     return jsonResponse({
       ok: true,
       ocupado: true,
       sessionId: active.sessionId,
       appId: null,
       expiresAt: active.expiresAt,
-      viewerUrl: buildViewerUrl(request.url, active.sessionId, '1')
+      viewerUrl: buildViewerUrl(request.url, active.sessionId, '1', active.viewerToken)
     }, 200, origin);
   }
 
@@ -165,11 +199,25 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
 
     const startedAt = Date.now();
     const fallbackId = createLocalSessionId();
+
+    // generate a viewer token for this session (for viewer links)
+    let viewerToken = null;
+    try {
+      if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+        viewerToken = crypto.randomUUID();
+      } else {
+        viewerToken = 'vt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+      }
+    } catch (_) {
+      viewerToken = 'vt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10);
+    }
+
     const sessionData = {
       sessionId: fallbackId,
       startedAt,
       expiresAt: startedAt + CAMERA_SESSION_TTL_SECONDS * 1000,
-      localMode: true
+      localMode: true,
+      viewerToken: viewerToken
     };
 
     await kv.put(CAMERA_KV_KEY, JSON.stringify(sessionData), {
@@ -182,7 +230,8 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       localMode: true,
       sessionId: fallbackId,
       appId: null,
-      viewerUrl: buildViewerUrl(request.url, fallbackId, '1'),
+      viewerUrl: buildViewerUrl(request.url, fallbackId, '1', viewerToken),
+      viewerToken: viewerToken,
       mensaje: 'Transmisión local activa.'
     }, 200, origin);
   }
@@ -248,7 +297,9 @@ async function handleFormulario(request, env, formData, bodyJson, origin) {
     }
   }
 
-  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1') : '');
+  const active = env.CAMERA_STATE ? await getActiveCameraSession(env.CAMERA_STATE) : null;
+  const tokenForUrl = active && active.viewerToken ? active.viewerToken : null;
+  const baseViewerUrl = viewerUrl || (activeSessionId ? buildViewerUrl(request.url, activeSessionId, '1', tokenForUrl) : '');
 
   const text = [
     '🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽',
