@@ -172,17 +172,18 @@ async function sendTelegramMessage(env, text, parseMode = null) {
 // ═══════════════════════════════════════════════════════════════
 //  CLOUDFLARE CALLS SFU — API
 // ═══════════════════════════════════════════════════════════════
-async function callsNewSession(cfg) {
+async function callsNewSession(cfg, sessionDescription) {
+  const body = sessionDescription ? { sessionDescription } : {};
   const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/new', {
     method: 'POST',
     headers: cfg.headers,
-    body: '{}'
+    body: JSON.stringify(body)
   });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok || !data.sessionId) {
     throw new Error('Calls crear sesión falló (' + resp.status + '): ' + JSON.stringify(data));
   }
-  return data.sessionId;
+  return data;
 }
 
 async function callsTracksNew(cfg, sessionId, payload) {
@@ -218,7 +219,7 @@ async function closeCallsSession(cfg, sessionId) {
   await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/' + sessionId + CALLS_CLOSE_PATH, {
     method: 'PUT',
     headers: cfg.headers,
-    body: JSON.stringify({ sessionDescription: { type: 'unspecified' } })
+    body: '{}'
   }).catch(() => {});
 }
 
@@ -259,12 +260,14 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       }, 409, origin);
     }
 
-    let sessionId;
+    const clientOffer = (bodyJson && bodyJson.sessionDescription) || null;
+    let created;
     try {
-      sessionId = await callsNewSession(cfg);
+      created = await callsNewSession(cfg, clientOffer);
     } catch (err) {
       return jsonResponse({ error: 'Error creando sesión de video: ' + err.message }, 502, origin);
     }
+    const sessionId = created.sessionId;
 
     const startedAt = Date.now();
     await setCameraSession(env, {
@@ -279,6 +282,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       ok: true,
       ocupado: false,
       sessionId,
+      sessionDescription: created.sessionDescription || null,
       appId: cfg.appId
     }, 200, origin);
   }
@@ -295,18 +299,21 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       }, 503, origin);
     }
 
-    let viewerSessionId;
+    const viewerOffer = (bodyJson && bodyJson.sessionDescription) || null;
+    let createdViewer;
     try {
-      viewerSessionId = await callsNewSession(cfg);
+      createdViewer = await callsNewSession(cfg, viewerOffer);
     } catch (err) {
       return jsonResponse({ error: err.message }, 502, origin);
     }
+    const viewerSessionId = createdViewer.sessionId;
 
     return jsonResponse({
       ok: true,
       ocupado: true,
       sourceSessionId: active.sessionId,
       viewerSessionId,
+      sessionDescription: createdViewer.sessionDescription || null,
       appId: cfg.appId,
       sourceTracks:
         Array.isArray(active.tracks) && active.tracks.length
