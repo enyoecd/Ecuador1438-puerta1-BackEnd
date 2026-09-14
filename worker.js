@@ -463,7 +463,7 @@ async function handleFormulario(request, env, formData, bodyJson, origin) {
   }
 }
 
-async function handleTimbre(env, origin, bodyJson, formData) {
+async function handleTimbre(request, env, origin, bodyJson, formData) {
   const now = Date.now();
   const clave = 'puerta1_timbre';
   const treintaMinutos = 30 * 60 * 1000;
@@ -521,12 +521,36 @@ async function handleTimbre(env, origin, bodyJson, formData) {
     }
   }
 
-  const textoTimbre = [
+  // Si hay una cámara activa, incluir el enlace público al visor (viewer-p1.html)
+  // para poder ver la transmisión en vivo desde Telegram (cualquier red / móvil).
+  let viewerLink = '';
+  try {
+    const active = await getActiveCameraSession(env.CAMERA_STATE);
+    if (active && active.sessionId) {
+      viewerLink = buildViewerUrl(
+        request.url,
+        active.sessionId,
+        '1',
+        active.viewerToken || null,
+        env.VIEWER_BASE_URL
+      );
+    }
+  } catch (e) {
+    console.error('Error al construir enlace del visor:', e);
+  }
+
+  const lineasTimbre = [
     '🔔🔔🔔🔔🔔🔔🔔🔔🔔',
     '',
-    '*🔔ESTÁN TOCANDO EL TIMBRE🔔*',
-    cantidad === 3 ? '\n⚠️ Se alcanzó el límite de 3 toques.\n⏳ Podrá volver a tocarse en 30 minutos.' : ''
-  ].join('\n');
+    '<b>🔔 ESTÁN TOCANDO EL TIMBRE 🔔</b>'
+  ];
+  if (viewerLink) {
+    lineasTimbre.push('', '<a href="' + escapeHtml(viewerLink) + '">🎥 Ver transmisión en vivo</a>');
+  }
+  if (cantidad === 3) {
+    lineasTimbre.push('', '⚠️ Se alcanzó el límite de 3 toques.', '⏳ Podrá volver a tocarse en 30 minutos.');
+  }
+  const textoTimbre = lineasTimbre.join('\n');
 
   try {
     const telegramResponse = await sendTelegramMessage(env, textoTimbre);
@@ -613,7 +637,7 @@ export default {
     }
 
     if (tipo === 'timbre') {
-      return handleTimbre(env, origin, bodyJson, formData);
+      return handleTimbre(request, env, origin, bodyJson, formData);
     }
 
     if (tipo === 'formulario') {
