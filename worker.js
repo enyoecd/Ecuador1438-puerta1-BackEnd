@@ -206,6 +206,69 @@ async function sendTelegramMessage(env, text, parseMode = null) {
 // ═══════════════════════════════════════════════════════════════
 //  CLOUDFLARE CALLS SFU — API
 // ═══════════════════════════════════════════════════════════════
+// Error normalizado de la API de Calls: conserva el status HTTP, la operación
+// que falló y la respuesta cruda del SFU para poder diagnosticar si el rechazo
+// viene de credenciales (401/403/404) o de negociación (400/4xx).
+class SfuError extends Error {
+  constructor(httpStatus, mensaje, operation, data) {
+    super(mensaje);
+    this.name = 'SfuError';
+    this.httpStatus = httpStatus;
+    this.operation = operation;
+    this.data = data || null;
+  }
+}
+
+// Traduce el error del SFU en un mensaje claro y accionable por status HTTP.
+function sfuErrorFriendly(httpStatus, data, operation) {
+  const rawCode = data && (data.errorCode || data.errorDescription)
+    ? String(data.errorCode || '') + (data.errorDescription ? ' — ' + data.errorDescription : '')
+    : '';
+  let motivo;
+  let sugerencia;
+
+  if (httpStatus === 401) {
+    motivo = 'El SFU rechazó la conexión: el Token_API es inválido o expiró.';
+    sugerencia = 'Regenera el token de la app en dash.cloudflare.com → Calls y actualiza el secret Token_API del Worker (wrangler secret put Token_API).';
+  } else if (httpStatus === 403) {
+    motivo = 'El SFU rechazó la conexión: el ID_app no está autorizado con el Token_API actual.';
+    sugerencia = 'Verifica que ID_app y Token_API pertenezcan a la MISMA app de Cloudflare Calls y que la app siga activa.';
+  } else if (httpStatus === 404) {
+    motivo = 'El SFU rechazó la conexión: el ID_app no existe o no coincide con el entorno activo.';
+    sugerencia = 'Confirma que el secret ID_app del Worker sea exactamente el Application ID de la app ACTIVA (production / dev / preview).';
+  } else if (httpStatus === 400) {
+    motivo = 'El SFU rechazó la negociación WebRTC (SDP u oferta inválida).';
+    sugerencia = 'Vuelve a intentar; si persiste, actualiza el frontend al flujo canónico de Cloudflare Calls (oferta única en tracks/new).';
+  } else if (httpStatus === 429) {
+    motivo = 'El SFU limitó temporalmente la cantidad de solicitudes.';
+    sugerencia = 'Espera unos segundos y vuelve a intentar.';
+  } else if (httpStatus > 0) {
+    motivo = 'El SFU respondió con error HTTP ' + httpStatus + '.';
+    sugerencia = 'Verifica la conectividad del Worker con rtc.live.cloudflare.com y que los secrets ID_app / Token_API del entorno activo sean correctos.';
+  } else {
+    motivo = 'El SFU no respondió correctamente.';
+    sugerencia = 'Revisa que los secrets ID_app y Token_API estén configurados en el Worker y que correspondan al entorno activo de Cloudflare Calls.';
+  }
+
+  return {
+    ok: false,
+    motivo,
+    sugerencia,
+    sfuStatus: httpStatus,
+    sfuOperacion: operation,
+    sfuDetalle: rawCode || 'Sin detalle devuelto por el SFU.'
+  };
+}
+
+// Convierte cualquier error de Calls en una respuesta HTTP 502 con el detalle
+// amigable para el frontend (mantiene autenticidad: el cliente solo lee "ok").
+function sfuErrorResponse(err, operation, origin) {
+  const status = (err && err.httpStatus) || 0;
+  const data = err && err.data ? err.data : null;
+  const friendly = sfuErrorFriendly(status, data, operation);
+  return jsonResponse({ error: friendly.motivo, ...friendly }, 502, origin);
+}
+
 async function callsNewSession(cfg, sessionDescription) {
   const body = sessionDescription ? { sessionDescription } : {};
   const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/new', {
@@ -214,8 +277,16 @@ async function callsNewSession(cfg, sessionDescription) {
     body: JSON.stringify(body)
   });
   const data = await resp.json().catch(() => ({}));
-  if (!resp.ok || !data.sessionId) {
-    throw new Error('Calls crear sesión falló (' + resp.status + '): ' + JSON.stringify(data));
+  // Cloudflare Calls puede responder HTTP 200 con un error en el cuerpo
+  // (errorCode/errorDescription), así que siempre se valida el cuerpo también.
+  if (data.errorCode) {
+    throw new SfuError(0, 'Calls crear sesión devolvió error', 'sessions/new', data);
+  }
+  if (!resp.ok) {
+    throw new SfuError(resp.status, 'Calls crear sesión falló', 'sessions/new', data);
+  }
+  if (!data.sessionId) {
+    throw new SfuError(0, 'Respuesta inválida de Calls (sin sessionId)', 'sessions/new', data);
   }
   return data;
 }
@@ -229,8 +300,14 @@ async function callsTracksNew(cfg, sessionId, payload) {
     body: JSON.stringify(body)
   });
   const data = await resp.json().catch(() => ({}));
+  if (data.errorCode) {
+    throw new SfuError(0, 'Calls tracks/new devolvió error', 'tracks/new', data);
+  }
   if (!resp.ok) {
-    throw new Error('Calls tracks/new falló (' + resp.status + '): ' + JSON.stringify(data));
+    throw new SfuError(resp.status, 'Calls tracks/new falló', 'tracks/new', data);
+  }
+  if (!data.sessionDescription) {
+    throw new SfuError(0, 'Respuesta inválida de Calls (sin sessionDescription)', 'tracks/new', data);
   }
   return data;
 }
@@ -243,9 +320,13 @@ async function callsRenegotiate(cfg, sessionId, sessionDescription) {
   });
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
-    throw new Error('Calls renegotiate falló (' + resp.status + '): ' + text);
+    throw new SfuError(resp.status, 'Calls renegotiate falló', 'renegotiate', { errorDescription: text });
   }
-  return resp.json().catch(() => ({}));
+  const data = await resp.json().catch(() => ({}));
+  if (data.errorCode) {
+    throw new SfuError(0, 'Calls renegotiate devolvió error', 'renegotiate', data);
+  }
+  return data;
 }
 
 async function closeCallsSession(cfg, sessionId) {
@@ -263,6 +344,52 @@ async function closeCallsSession(cfg, sessionId) {
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   const cfg = callsConfig(env);
 
+  // ── DIAGNÓSTICO (GET) — valida credenciales del SFU ──────────
+  // Crea (y cierra) una sesión vacía para comprobar que ID_app y Token_API
+  // existen, no expiraron y coinciden con el entorno activo, sin interferir
+  // con la transmisión en curso. Lo usa el frontend cuando el SFU rechaza.
+  if (accion === 'diagnostico') {
+    if (!cfg) {
+      return jsonResponse({
+        ok: false,
+        error: 'Cloudflare Calls no configurado.',
+        motivo: 'Faltan los secrets ID_app y/o Token_API en el Worker.',
+        pasos: [
+          'Abre dash.cloudflare.com → Workers & Pages → puerta1-ecuador1438 → Settings → Variables and Secrets.',
+          'Define el secret ID_app con el Application ID de Cloudflare Calls.',
+          'Define el secret Token_API con el token (app secret) de Cloudflare Calls.',
+          'Verifica que ambos secrets pertenezcan al ENTORNO activo que sirve tu página (production o preview).',
+          'Despliega el Worker de nuevo (wrangler deploy) para aplicar los cambios.'
+        ]
+      }, 503, origin);
+    }
+    try {
+      const test = await callsNewSession(cfg, null);
+      await closeCallsSession(cfg, test.sessionId);
+      return jsonResponse({
+        ok: true,
+        appIdDefinido: true,
+        tokenDefinido: true,
+        appId: cfg.appId,
+        mensaje: 'Credenciales válidas: el SFU aceptó el ID_app y el Token_API.',
+        sesionPrueba: test.sessionId
+      }, 200, origin);
+    } catch (err) {
+      const friendly = sfuErrorFriendly((err && err.httpStatus) || 0, (err && err.data) || null, 'diagnostico');
+      return jsonResponse({
+        ok: false,
+        error: friendly.motivo,
+        ...friendly,
+        pasos: [
+          'Abre dash.cloudflare.com → Calls y confirma que la app siga ACTIVA.',
+          'Si el token expiró, regenéralo y actualiza el secret Token_API del Worker.',
+          'Confirma que el secret ID_app sea exactamente el Application ID de esa app.',
+          'Despliega el Worker (wrangler deploy) tras actualizar los secrets.'
+        ]
+      }, 502, origin);
+    }
+  }
+
   // ── ESTADO (GET) ──────────────────────────────────────────────
   if (accion === 'estado') {
     const active = await getCameraSession(env);
@@ -277,6 +404,9 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   }
 
   // ── INICIAR (POST) ────────────────────────────────────────────
+  // Patrón canónico de Cloudflare Realtime: la sesión se crea SIN oferta SDP
+  // (sessions/new vacío) y la publicación se hace después con una oferta ÚNICA
+  // en tracks/new. Esto elimina la doble negociación que el SFU rechazaba.
   if (accion === 'iniciar') {
     if (!cfg) {
       return jsonResponse({
@@ -294,12 +424,11 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       }, 409, origin);
     }
 
-    const clientOffer = (bodyJson && bodyJson.sessionDescription) || null;
     let created;
     try {
-      created = await callsNewSession(cfg, clientOffer);
+      created = await callsNewSession(cfg, null);
     } catch (err) {
-      return jsonResponse({ error: 'Error creando sesión de video: ' + err.message }, 502, origin);
+      return sfuErrorResponse(err, 'iniciar', origin);
     }
     const sessionId = created.sessionId;
 
@@ -333,12 +462,13 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       }, 503, origin);
     }
 
-    const viewerOffer = (bodyJson && bodyJson.sessionDescription) || null;
     let createdViewer;
     try {
-      createdViewer = await callsNewSession(cfg, viewerOffer);
+      // Patrón canónico: sesión vacía; la suscripción se hace después en
+      // tracks/new, donde el SFU devuelve la oferta a responder.
+      createdViewer = await callsNewSession(cfg, null);
     } catch (err) {
-      return jsonResponse({ error: err.message }, 502, origin);
+      return sfuErrorResponse(err, 'viewer', origin);
     }
     const viewerSessionId = createdViewer.sessionId;
 
@@ -430,7 +560,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
 
       return jsonResponse(result, 200, origin);
     } catch (err) {
-      return jsonResponse({ error: err.message }, 502, origin);
+      return sfuErrorResponse(err, 'tracks-new', origin);
     }
   }
 
@@ -452,7 +582,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       await callsRenegotiate(cfg, sessionId, sessionDescription);
       return jsonResponse({ ok: true, sessionId }, 200, origin);
     } catch (err) {
-      return jsonResponse({ error: err.message }, 502, origin);
+      return sfuErrorResponse(err, 'renegotiate', origin);
     }
   }
 
