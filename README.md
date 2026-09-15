@@ -11,9 +11,9 @@ video en tiempo real del timbre usando **Cloudflare Calls (Realtime SFU)**.
 | `Token_API`         | Token (app secret) de Cloudflare Calls. **Secreto.**             |
 | `TELEGRAM_BOT_TOKEN`| Token del bot de Telegram (ya existente). **Secreto.**           |
 | `TELEGRAM_CHAT_ID`  | Chat de Telegram destino (ya existente).                          |
-| `VIEWER_BASE_URL`   | URL base pública del frontend. Ej. `https://enyoecd.github.io/Ecuador1438`. |
-| `CAMERA_STATE`      | Binding KV (opcional) con el estado de la sesión de cámara.       |
-| `TIMBRE_KV`         | Binding KV (opcional) para el límite de 3 toques del timbre.      |
+| `ALLOWED_ORIGINS`   | Origen exacto de Cloudflare Pages (varios valores separados por comas). Requerido para restringir CORS en producción. |
+| `CAMERA_STATE`      | Binding KV **obligatorio en producción** para el estado de la sesión de cámara. |
+| `TIMBRE_KV`         | Binding KV **obligatorio en producción** para el límite de 3 toques del timbre. |
 
 ### Cargar los secrets
 
@@ -23,10 +23,16 @@ wrangler secret put Token_API
 # TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID ya deberían existir
 ```
 
-### Enlazar los KV (opcional pero recomendado)
+### Enlazar los KV (obligatorio en producción)
 
-En `wrangler.jsonc` descomenta el bloque `kv_namespaces` con los IDs de los
-namespaces `CAMERA_STATE` y `TIMBRE_KV`.
+En `wrangler.jsonc` descomenta el bloque `kv_namespaces` con los IDs reales de
+los namespaces `CAMERA_STATE` y `TIMBRE_KV`. Sin ellos, el Worker puede atender
+dos solicitudes en instancias distintas y perder el estado de cámara o del
+límite de timbre.
+
+Configura también `ALLOWED_ORIGINS` en Cloudflare con el dominio de producción
+de Pages. El enlace de Telegram al visor se construye desde el `Origin` HTTPS
+de la página de Pages que inició la cámara, sin una URL fija de GitHub o Pages.
 
 ## Endpoints
 
@@ -35,7 +41,7 @@ namespaces `CAMERA_STATE` y `TIMBRE_KV`.
 - `POST tipo=camara&accion=tracks-new` → publica/suscribe tracks en el SFU. Cuando el
   publicador conecta su cámara (tracks con `location: local`), se envía
   automáticamente a Telegram **solo la URL pública del visor**
-  (`<VIEWER_BASE_URL>/viewer-p1.html`) para poder ver el streaming en vivo desde el chat
+  (`<Origin de Pages>/viewer-p1.html`) para poder ver el streaming en vivo desde el chat
   (física: el enlace se manda una vez, al iniciarse la transmisión).
 - `POST tipo=camara&accion=renegotiate` → responde a la renegociación del SFU.
 - `POST tipo=camara&accion=viewer` → prepara una sesión para el visor.

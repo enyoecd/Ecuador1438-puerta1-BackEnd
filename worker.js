@@ -23,10 +23,9 @@
 //  Variables de entorno:
 //    ID_app, Token_API                 → Cloudflare Calls (requeridas)
 //    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID → Telegram (ya existentes)
-//    VIEWER_BASE_URL                   → host público del frontend
-//                                        (ej. https://enyoecd.github.io/Ecuador1438)
-//    CAMERA_STATE  (KV binding, opcional) → estado de sesión persistente
-//    TIMBRE_KV     (KV binding, opcional) → límite de toques del timbre
+//    ALLOWED_ORIGINS                   → origen/es de Pages autorizados por CORS
+//    CAMERA_STATE  (KV binding)        → estado de sesión persistente
+//    TIMBRE_KV     (KV binding)        → límite de toques del timbre
 // ═══════════════════════════════════════════════════════════════
 
 const CAMERA_KV_KEY = 'puerta1_camera_session';
@@ -46,7 +45,7 @@ const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
 const CALLS_CLOSE_PATH = '/close';
 
 // ═══════════════════════════════════════════════════════════════
-//  MEMORIA LOCAL (fallback si no hay binding KV)
+//  MEMORIA LOCAL (sólo fallback de desarrollo; no usar en producción)
 // ═══════════════════════════════════════════════════════════════
 const memoStore = new Map();
 
@@ -108,18 +107,32 @@ async function deleteCameraSession(env) {
 //  HELPERS HTTP
 // ═══════════════════════════════════════════════════════════════
 function corsHeaders(origin) {
-  // Responder con el Origin recibido cuando sea posible y marcar Vary: Origin
-  // para evitar respuestas cacheadas con un Access-Control-Allow-Origin incorrecto.
-  return {
-    'Access-Control-Allow-Origin': origin || '*',
+  const headers = {
     'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     'Vary': 'Origin'
   };
+  if (origin) headers['Access-Control-Allow-Origin'] = origin;
+  return headers;
 }
 
-function jsonResponse(data, status = 200, origin = '*') {
+function allowedRequestOrigin(request, env) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return null;
+
+  const allowed = String(env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+
+  // Durante la transición no se bloquea el frontend si aún no se ha cargado
+  // la variable. Una vez definida, sólo se acepta la lista explícita.
+  if (!allowed.length || allowed.includes(origin)) return origin;
+  return null;
+}
+
+function jsonResponse(data, status = 200, origin = null) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
@@ -155,12 +168,14 @@ function callsConfig(env) {
 // ═══════════════════════════════════════════════════════════════
 //  URL PÚBLICA DEL VISOR
 // ═══════════════════════════════════════════════════════════════
-function buildViewerUrl(request, env) {
-  const base = String(env.VIEWER_BASE_URL || '').replace(/\/+$/, '');
-  if (base) {
-    return base + '/viewer-p1.html';
+function buildViewerUrl(request) {
+  // Pages siempre envía Origin en estas solicitudes cross-origin. Así el
+  // enlace publicado sigue el dominio real de Pages y no el del Worker.
+  const origin = request.headers.get('Origin');
+  if (origin && /^https:\/\/[^/]+$/i.test(origin)) {
+    return origin + '/viewer-p1.html';
   }
-  return new URL('/viewer-p1.html', request.url).toString();
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -338,7 +353,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         Array.isArray(active.tracks) && active.tracks.length
           ? active.tracks
           : [{ trackName: 'video' }, { trackName: 'audio' }],
-      viewerUrl: buildViewerUrl(request, env)
+      viewerUrl: buildViewerUrl(request)
     }, 200, origin);
   }
 
@@ -394,9 +409,12 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         if (isPush) {
           let telegramEnviado = false;
           let telegramError = null;
-          if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && !active.telegramSent) {
+          const viewerUrl = buildViewerUrl(request);
+          if (!viewerUrl) {
+            telegramError = 'No se pudo determinar la URL pública de Cloudflare Pages.';
+          } else if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && !active.telegramSent) {
             try {
-              await sendTelegramMessage(env, buildViewerUrl(request, env));
+              await sendTelegramMessage(env, viewerUrl);
               telegramEnviado = true;
               active.telegramSent = true;
             } catch (err) {
@@ -559,6 +577,7 @@ async function handleTimbre(request, env, origin, bodyJson, formData) {
       success: true,
       tipo: 'timbre',
       bloqueado: cantidad === 3,
+      minutos_restantes: cantidad === 3 ? 30 : 0,
       toques_realizados: cantidad,
       result: telegramResult
     }, 200, origin);
@@ -664,7 +683,12 @@ ${mensajeUsuario}`;
 // ═══════════════════════════════════════════════════════════════
 export default {
   async fetch(request, env) {
-    const origin = request.headers.get('Origin') || '*';
+    const requestedOrigin = request.headers.get('Origin');
+    const origin = allowedRequestOrigin(request, env);
+
+    if (requestedOrigin && !origin) {
+      return jsonResponse({ error: 'Origin no autorizado' }, 403);
+    }
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
