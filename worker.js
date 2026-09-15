@@ -270,12 +270,15 @@ function sfuErrorResponse(err, operation, origin) {
 }
 
 async function callsNewSession(cfg, sessionDescription) {
-  const body = sessionDescription ? { sessionDescription } : {};
-  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/new', {
-    method: 'POST',
-    headers: cfg.headers,
-    body: JSON.stringify(body)
-  });
+  const options = { method: 'POST', headers: cfg.headers };
+  // Sesión vacía (patrón canónico): NO se envía cuerpo. Enviar un JSON "{}"
+  // hace que el validador de Calls rechace el body con "decoding_error
+  // / Body JSON validation error: sessionDescription". El ejemplo oficial
+  // (realtime-examples) crea la sesión también sin cuerpo.
+  if (sessionDescription) {
+    options.body = JSON.stringify({ sessionDescription });
+  }
+  const resp = await fetch(CALLS_API_BASE + '/' + cfg.appId + '/sessions/new', options);
   const data = await resp.json().catch(() => ({}));
   // Cloudflare Calls puede responder HTTP 200 con un error en el cuerpo
   // (errorCode/errorDescription), así que siempre se valida el cuerpo también.
