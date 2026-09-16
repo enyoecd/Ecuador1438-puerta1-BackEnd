@@ -15,7 +15,10 @@
   //
   // 2) Variables no secretas a configurar en Cloudflare antes del deploy:
   //    ALLOWED_ORIGINS  → origen exacto de Pages, separado por comas si hay más de uno.
-  //                        Ej.: https://<tu-proyecto>.pages.dev
+  //                        Valor real verificado de producción: https://ecuador1438.pages.dev
+  //                        (minúsculas; NO es "Ecuador1438.page.dev", ese dominio no existe).
+  //                        Si pruebas en local con VS Code Live Server, añade también:
+  //                        https://ecuador1438.pages.dev,http://localhost:5500,http://127.0.0.1:5500
   //    El enlace del visor se deriva siempre del Origin HTTPS de la solicitud
   //    que llega desde Cloudflare Pages; no se configura una URL fija.
 
