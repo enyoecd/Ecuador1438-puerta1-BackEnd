@@ -726,6 +726,96 @@ async function handleTimbre(request, env, origin, bodyJson, formData) {
 // ═══════════════════════════════════════════════════════════════
 //  FORMULARIO (comportamiento original preservado)
 // ═══════════════════════════════════════════════════════════════
+// Límites de Telegram que producen rechazos 400 "Bad Request":
+//   - sendMessage: 4096 caracteres de texto.
+//   - sendPhoto / sendDocument: 1024 caracteres de caption.
+// El formulario de Puerta 1 arma un mensaje largo (incluye el motivo de
+// contacto y las fechas de ingreso/envío), así que al adjuntar una foto el
+// caption podía superar los 1024 y Telegram rechazaba el envío. Estos
+// helpers evitan ese rechazo sin perder información: la foto viaja con un
+// caption recortado y el texto completo se manda aparte.
+const TELEGRAM_TEXT_LIMIT = 4096;
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+function dividirTextoTelegram(texto, limite) {
+  const partes = [];
+  const total = Math.max(1, Math.ceil(texto.length / limite));
+  for (let i = 0; i < total; i++) {
+    partes.push(texto.slice(i * limite, (i + 1) * limite));
+  }
+  return partes;
+}
+
+async function enviarTextoTelegram(env, texto) {
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  let ultimo = null;
+  for (const parte of dividirTextoTelegram(texto, TELEGRAM_TEXT_LIMIT)) {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text: parte })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      const err = new Error('Error al enviar el formulario a Telegram');
+      err.telegram_status = resp.status;
+      err.telegram_response = data;
+      throw err;
+    }
+    ultimo = data;
+  }
+  return ultimo;
+}
+
+async function enviarArchivoTelegram(env, foto, caption, metodo) {
+  const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${metodo}`;
+  const telegramForm = new FormData();
+  telegramForm.append('chat_id', env.TELEGRAM_CHAT_ID);
+  telegramForm.append('caption', caption);
+  telegramForm.append(metodo === 'sendDocument' ? 'document' : 'photo', foto, foto.name || 'foto.jpg');
+  const resp = await fetch(url, { method: 'POST', body: telegramForm });
+  const data = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+function recortarCaptionTelegram(texto) {
+  if (texto.length <= TELEGRAM_CAPTION_LIMIT) return texto;
+  let corte = TELEGRAM_CAPTION_LIMIT - 1; // espacio para el carácter de corte
+  const anterior = texto.charCodeAt(corte - 1);
+  if (anterior >= 0xd800 && anterior <= 0xdbff) {
+    corte -= 1; // no partir un par sustituto (emojis)
+  }
+  return texto.slice(0, corte) + '…';
+}
+
+async function enviarFormularioTelegram(env, foto, textoMensaje) {
+  const recortado = textoMensaje.length > TELEGRAM_CAPTION_LIMIT;
+  const caption = recortarCaptionTelegram(textoMensaje);
+
+  if (foto) {
+    // sendPhoto recomprime la imagen y acepta hasta 10 MB; si la imagen no es
+    // válida para Telegram o excede ese tamaño, se reintenta como documento
+    // (hasta 50 MB) para no perder el adjunto.
+    let envio = await enviarArchivoTelegram(env, foto, caption, 'sendPhoto');
+    if (!envio.ok) {
+      envio = await enviarArchivoTelegram(env, foto, caption, 'sendDocument');
+    }
+    if (!envio.ok) {
+      const err = new Error('Error al enviar el formulario a Telegram');
+      err.telegram_status = envio.status;
+      err.telegram_response = envio.data;
+      throw err;
+    }
+    // El mensaje completo no cupo en el caption: se envía como texto aparte.
+    if (recortado) {
+      await enviarTextoTelegram(env, textoMensaje);
+    }
+    return envio.data;
+  }
+
+  return await enviarTextoTelegram(env, textoMensaje);
+}
+
 async function handleFormulario(request, env, origin, bodyJson, formData) {
   let nombre = 'No especificado';
   let email = 'No especificado';
@@ -763,40 +853,8 @@ async function handleFormulario(request, env, origin, bodyJson, formData) {
 
 ${mensajeUsuario}`;
 
-  const telegramBaseUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
-  let response;
-
   try {
-    if (foto) {
-      const telegramForm = new FormData();
-      telegramForm.append('chat_id', env.TELEGRAM_CHAT_ID);
-      telegramForm.append('caption', textoMensaje);
-      telegramForm.append('photo', foto, foto.name || 'foto.jpg');
-      response = await fetch(`${telegramBaseUrl}/sendPhoto`, {
-        method: 'POST',
-        body: telegramForm
-      });
-    } else {
-      response = await fetch(`${telegramBaseUrl}/sendMessage`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: env.TELEGRAM_CHAT_ID,
-          text: textoMensaje
-        })
-      });
-    }
-
-    const telegramResult = await response.json();
-    if (!response.ok) {
-      return jsonResponse({
-        success: false,
-        error: 'Error al enviar el formulario a Telegram',
-        telegram_status: response.status,
-        telegram_response: telegramResult
-      }, 500, origin);
-    }
-
+    const telegramResult = await enviarFormularioTelegram(env, foto, textoMensaje);
     return jsonResponse({
       success: true,
       tipo: 'formulario',
@@ -806,6 +864,8 @@ ${mensajeUsuario}`;
     return jsonResponse({
       success: false,
       error: error.message,
+      telegram_status: error.telegram_status,
+      telegram_response: error.telegram_response,
       tipo: 'formulario'
     }, 500, origin);
   }
