@@ -1,6 +1,6 @@
 # Ecuador1438-BackEnd
 
-Worker de Ecuador1438 — Puerta 1. Gestiona timbre, formulario y la transmisión de
+Worker de Ecuador1438 — Puerta 1. Gestiona timbre, camara1, formulario y la transmisión de
 video en tiempo real del timbre usando **Cloudflare Calls (Realtime SFU)**.
 
 ## Variables de entorno
