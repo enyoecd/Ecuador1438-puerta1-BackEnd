@@ -38,6 +38,7 @@ const CAMERA_SESSION_TTL_SECONDS = 6 * 60;
 // avisar, este lease expira y el estado "en uso" se libera solo (sin bloqueo
 // fantasma). El emisor renueva cada ~20 s con la acción "latido".
 const CAMERA_LEASE_MS = 60 * 1000;
+const CAMERA_SETUP_TTL_MS = 2 * 60 * 1000;
 // TTL con el que se escriben/renuevan las claves en KV (un poco mayor que el
 // lease para que KV limpie solo los restos).
 const CAMERA_KV_EXPIRATION_TTL = 180;
@@ -45,18 +46,12 @@ const CALLS_API_BASE = 'https://rtc.live.cloudflare.com/v1/apps';
 const CALLS_CLOSE_PATH = '/close';
 
 // ═══════════════════════════════════════════════════════════════
-//  MEMORIA LOCAL (sólo fallback de desarrollo; no usar en producción)
+//  ESTADO PERSISTENTE DE CÁMARA (Cloudflare KV obligatorio)
 // ═══════════════════════════════════════════════════════════════
-const memoStore = new Map();
-
 async function getCameraSession(env) {
   const ttlMs = CAMERA_SESSION_TTL_SECONDS * 1000;
-  let raw = null;
-  if (env.CAMERA_STATE) {
-    raw = await env.CAMERA_STATE.get(CAMERA_KV_KEY).catch(() => null);
-  } else {
-    raw = memoStore.get(CAMERA_KV_KEY) || null;
-  }
+  if (!env.CAMERA_STATE) throw new Error('CAMERA_STATE no esta configurado');
+  const raw = await env.CAMERA_STATE.get(CAMERA_KV_KEY);
   if (!raw) return null;
 
   let session = null;
@@ -76,7 +71,9 @@ async function getCameraSession(env) {
     !session ||
     !session.sessionId ||
     !Number.isFinite(Number(session.startedAt)) ||
-    now > (Number(session.expiresAt) || Number(session.startedAt) + ttlMs)
+    now > (session.activatedAt
+      ? (Number(session.expiresAt) || Number(session.startedAt) + ttlMs)
+      : (Number(session.setupExpiresAt) || Number(session.startedAt) + CAMERA_SETUP_TTL_MS))
   ) {
     await deleteCameraSession(env);
     return null;
@@ -85,22 +82,16 @@ async function getCameraSession(env) {
 }
 
 async function setCameraSession(env, data) {
+  if (!env.CAMERA_STATE) throw new Error('CAMERA_STATE no esta configurado');
   const value = JSON.stringify(data);
-  if (env.CAMERA_STATE) {
-    await env.CAMERA_STATE.put(CAMERA_KV_KEY, value, {
-      expirationTtl: CAMERA_KV_EXPIRATION_TTL
-    }).catch(() => {});
-  } else {
-    memoStore.set(CAMERA_KV_KEY, value);
-  }
+  await env.CAMERA_STATE.put(CAMERA_KV_KEY, value, {
+    expirationTtl: CAMERA_KV_EXPIRATION_TTL
+  });
 }
 
 async function deleteCameraSession(env) {
-  if (env.CAMERA_STATE) {
-    await env.CAMERA_STATE.delete(CAMERA_KV_KEY).catch(() => {});
-  } else {
-    memoStore.delete(CAMERA_KV_KEY);
-  }
+  if (!env.CAMERA_STATE) throw new Error('CAMERA_STATE no esta configurado');
+  await env.CAMERA_STATE.delete(CAMERA_KV_KEY);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -163,6 +154,22 @@ function callsConfig(env) {
       'Content-Type': 'application/json'
     }
   };
+}
+
+function getIceServers(env) {
+  const servers = [{ urls: [
+    'stun:stun.cloudflare.com:3478',
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302'
+  ] }];
+  if (env.TURN_URLS && env.TURN_USERNAME && env.TURN_CREDENTIAL) {
+    servers.push({
+      urls: String(env.TURN_URLS).split(',').map((url) => url.trim()).filter(Boolean),
+      username: env.TURN_USERNAME,
+      credential: env.TURN_CREDENTIAL
+    });
+  }
+  return servers;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -346,6 +353,9 @@ async function closeCallsSession(cfg, sessionId) {
 // ═══════════════════════════════════════════════════════════════
 async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   const cfg = callsConfig(env);
+  if (!env.CAMERA_STATE) {
+    return jsonResponse({ error: 'CAMERA_STATE no esta configurado en el Worker.' }, 503, origin);
+  }
 
   // ── DIAGNÓSTICO (GET) — valida credenciales del SFU ──────────
   // Crea (y cierra) una sesión vacía para comprobar que ID_app y Token_API
@@ -391,6 +401,10 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         ]
       }, 502, origin);
     }
+  }
+
+  if (accion === 'ice-config') {
+    return jsonResponse({ ok: true, iceServers: getIceServers(env) }, 200, origin);
   }
 
   // ── ESTADO (GET) ──────────────────────────────────────────────
@@ -439,7 +453,10 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
     await setCameraSession(env, {
       sessionId,
       startedAt,
-      expiresAt: startedAt + CAMERA_LEASE_MS,
+      // La reserva vence si no termina la negociacion; el lease inicia en activar.
+      setupExpiresAt: startedAt + CAMERA_SETUP_TTL_MS,
+      activatedAt: null,
+      expiresAt: null,
       tracks: [],
       telegramSent: false
     });
@@ -449,14 +466,15 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       ocupado: false,
       sessionId,
       sessionDescription: created.sessionDescription || null,
-      appId: cfg.appId
+      appId: cfg.appId,
+      iceServers: getIceServers(env)
     }, 200, origin);
   }
 
   // ── PREPARAR VISOR (POST) ─────────────────────────────────────
   if (accion === 'viewer') {
     const active = await getCameraSession(env);
-    if (!active) {
+    if (!active || !active.activatedAt) {
       return jsonResponse({ ocupado: false, mensaje: 'Sin transmisión activa' }, 200, origin);
     }
     if (!cfg) {
@@ -482,6 +500,7 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       viewerSessionId,
       sessionDescription: createdViewer.sessionDescription || null,
       appId: cfg.appId,
+      iceServers: getIceServers(env),
       sourceTracks:
         Array.isArray(active.tracks) && active.tracks.length
           ? active.tracks
@@ -536,27 +555,9 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
         } else if (Array.isArray(result.tracks) && result.tracks.length) {
           active.tracks = result.tracks;
         }
-        // Cualquier actividad del emisor renueva el lease de la sesión.
-        active.expiresAt = Date.now() + CAMERA_LEASE_MS;
-
         if (isPush) {
-          let telegramEnviado = false;
-          let telegramError = null;
-          const viewerUrl = buildViewerUrl(request);
-          if (!viewerUrl) {
-            telegramError = 'No se pudo determinar la URL pública de Cloudflare Pages.';
-          } else if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && !active.telegramSent) {
-            try {
-              await sendTelegramMessage(env, viewerUrl);
-              telegramEnviado = true;
-              active.telegramSent = true;
-            } catch (err) {
-              telegramError = err.message || 'Error al enviar a Telegram';
-              console.error('Error al enviar el enlace del visor a Telegram:', telegramError);
-            }
-          }
           await setCameraSession(env, active);
-          return jsonResponse({ ...result, telegramEnviado, telegramError }, 200, origin);
+          return jsonResponse(result, 200, origin);
         }
         await setCameraSession(env, active);
       }
@@ -593,9 +594,37 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
   // Renueva el lease corto de la sesión mientras la página emisora sigue
   // transmitiendo. Si el emisor desaparece (cierra la pestaña o cae sin avisar),
   // el lease expira y "estado" deja de reportar "ocupado".
+  // El publicador confirma que aplico la respuesta SDP. Solo ahora empieza el
+  // lease de transmision y se publica el enlace para los visores.
+  if (accion === 'activar') {
+    const sid = (bodyJson && bodyJson.sessionId) || (formData && formData.get('sessionId')) || null;
+    const active = await getCameraSession(env);
+    if (!active || !sid || sid !== active.sessionId) {
+      return jsonResponse({ ok: false, ocupado: false, error: 'La sesion ya no esta activa.' }, 409, origin);
+    }
+    active.activatedAt = Date.now();
+    active.expiresAt = active.activatedAt + CAMERA_LEASE_MS;
+    let telegramEnviado = false;
+    let telegramError = null;
+    const viewerUrl = buildViewerUrl(request);
+    if (!viewerUrl) {
+      telegramError = 'No se pudo determinar la URL publica del visor.';
+    } else if (env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID && !active.telegramSent) {
+      try {
+        await sendTelegramMessage(env, viewerUrl);
+        active.telegramSent = true;
+        telegramEnviado = true;
+      } catch (err) {
+        telegramError = err.message || 'Error al enviar a Telegram';
+      }
+    }
+    await setCameraSession(env, active);
+    return jsonResponse({ ok: true, ocupado: true, telegramEnviado, telegramError }, 200, origin);
+  }
+
   if (accion === 'latido') {
     const active = await getCameraSession(env);
-    if (!active) {
+    if (!active || !active.activatedAt) {
       return jsonResponse({ ok: true, ocupado: false }, 200, origin);
     }
     const sid =
@@ -615,14 +644,12 @@ async function handleCamera(request, env, accion, formData, bodyJson, origin) {
       (bodyJson && bodyJson.sessionId) ||
       (formData && formData.get('sessionId')) || null;
     const active = await getCameraSession(env);
-    const sid = sessionId || (active && active.sessionId) || null;
-
-    if (sid) {
-      await closeCallsSession(cfg, sid);
+    if (active && sessionId && sessionId === active.sessionId) {
+      await closeCallsSession(cfg, sessionId);
       await deleteCameraSession(env);
-      return jsonResponse({ ok: true, sessionId: sid }, 200, origin);
+      return jsonResponse({ ok: true, sessionId }, 200, origin);
     }
-    return jsonResponse({ ok: true }, 200, origin);
+    return jsonResponse({ ok: true, ignorado: true }, 200, origin);
   }
 
   // ── FINALIZAR VISOR (POST) ────────────────────────────────────
@@ -874,8 +901,37 @@ ${mensajeUsuario}`;
 // ═══════════════════════════════════════════════════════════════
 //  EXPORT PRINCIPAL
 // ═══════════════════════════════════════════════════════════════
+export class CameraCoordinator {
+  constructor(state, env) { this.state = state; this.env = env; }
+  async fetch(request) {
+    return this.state.blockConcurrencyWhile(() => handleCameraRequest(request, this.env));
+  }
+}
+
+async function handleCameraRequest(request, env) {
+  const requestedOrigin = request.headers.get('Origin');
+  const origin = allowedRequestOrigin(request, env);
+  if (requestedOrigin && !origin) return jsonResponse({ error: 'Origin no autorizado' }, 403);
+  if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(origin) });
+  const url = new URL(request.url);
+  let accion = url.searchParams.get('accion') || '';
+  let formData = null;
+  let bodyJson = null;
+  if (request.method === 'POST' || request.method === 'PUT') {
+    const contentType = request.headers.get('Content-Type') || '';
+    if (contentType.includes('application/json')) {
+      try { bodyJson = await request.json(); } catch (_) {}
+    } else if (contentType.includes('multipart/form-data') || contentType.includes('application/x-www-form-urlencoded')) {
+      try { formData = await request.formData(); } catch (_) {}
+    }
+    accion = accion || (bodyJson && bodyJson.accion) || (formData && formData.get('accion')) || '';
+  }
+  return handleCamera(request, env, accion, formData, bodyJson, origin);
+}
+
 export default {
   async fetch(request, env) {
+    const requestForCamera = request.clone();
     const requestedOrigin = request.headers.get('Origin');
     const origin = allowedRequestOrigin(request, env);
 
@@ -930,7 +986,10 @@ export default {
     accion = accion || url.searchParams.get('accion') || '';
 
     if (tipo === 'camara') {
-      return handleCamera(request, env, accion, formData, bodyJson, origin);
+      if (!env.CAMERA_COORDINATOR) {
+        return jsonResponse({ error: 'CAMERA_COORDINATOR no esta configurado.' }, 503, origin);
+      }
+      return env.CAMERA_COORDINATOR.get(env.CAMERA_COORDINATOR.idFromName('puerta1')).fetch(requestForCamera);
     }
 
     if (tipo === 'timbre') {

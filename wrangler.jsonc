@@ -12,6 +12,8 @@
   //    ID_app     → App ID de Cloudflare Calls (Realtime SFU)
   //    Token_API  → Token de la app de Cloudflare Calls
   //    (TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID ya existen en Cloudflare)
+  //    TURN_URLS, TURN_USERNAME y TURN_CREDENTIAL -> credenciales efímeras
+  //    del servicio TURN de Cloudflare. Se entregan al navegador sólo al iniciar.
   //
   // 2) Variables no secretas a configurar en Cloudflare antes del deploy:
   //    ALLOWED_ORIGINS  → origen exacto de Pages, separado por comas si hay más de uno.
@@ -22,9 +24,15 @@
   //    El enlace del visor se deriva siempre del Origin HTTPS de la solicitud
   //    que llega desde Cloudflare Pages; no se configura una URL fija.
 
-  // 3) KV obligatorio en producción para estado de cámara y límites de timbre:
-  //    "kv_namespaces": [
-  //      { "binding": "CAMERA_STATE", "id": "ID_NAMESPACE_CAMARA" },
-  //      { "binding": "TIMBRE_KV",    "id": "ID_NAMESPACE_TIMBRE" }
-  //    ]
+  "kv_namespaces": [
+    { "binding": "CAMERA_STATE", "id": "ID_NAMESPACE_CAMARA" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "CAMERA_COORDINATOR", "class_name": "CameraCoordinator" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1-camera-coordinator", "new_sqlite_classes": ["CameraCoordinator"] }
+  ]
 }
