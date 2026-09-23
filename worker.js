@@ -14,7 +14,7 @@ export default {
     }
 
     // ============================================================
-    // 2. Solo permitir POST
+    // 2. Solo permitir POST.
     // ============================================================
     if (request.method !== "POST") {
       return new Response("Método no permitido", {
