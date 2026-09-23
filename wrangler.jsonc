@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "puerta1-ecuador1438",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-09"
+
+  // ── Secrets (NO van en este archivo; cárgalos con la CLI o el dashboard):
+  //      wrangler secret put TELEGRAM_BOT_TOKEN
+  //      wrangler secret put TELEGRAM_CHAT_ID
+  //    TELEGRAM_BOT_TOKEN → Token del bot de Telegram
+  //    TELEGRAM_CHAT_ID   → Chat/ID de destino en Telegram
+
+  // ── KV opcional (recomendado) para límites del timbre:
+  //    "kv_namespaces": [
+  //      { "binding": "TIMBRE_KV", "id": "ID_NAMESPACE_TIMBRE" }
+  //    ]
+}
