@@ -9,6 +9,26 @@
 
 const CALLS_BASE = "https://rtc.live.cloudflare.com/v1";
 
+// ============================================================
+// Registro en memoria de llamadas cruzadas (pairing) para la
+// videollamada bidireccional (WHEP/WHIP simultáneo).
+//   clave  → ID estable de puerta (p. ej. "puerta1")
+//   valor  → { returnSession, tracks, at }
+// El visor publica su sesión de retorno con POST /pair y la
+// puerta la consulta (long-poll simple) con GET /pair-status.
+// El estado es en memoria: suficiente para una puerta. Si se
+// necesita durabilidad real, migra esto a un Durable Object.
+// ============================================================
+const returnRegistry = new Map();
+const PAIR_TTL_MS = 12 * 60 * 60 * 1000; // 12 h
+
+function pruneExpiredPairs() {
+	const now = Date.now();
+	for (const [key, entry] of returnRegistry) {
+		if (now - entry.at > PAIR_TTL_MS) returnRegistry.delete(key);
+	}
+}
+
 const CORS_HEADERS = {
 	"Access-Control-Allow-Origin": "*",
 	"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -116,6 +136,62 @@ async function proxyCallsRequest(request, url, cf) {
 }
 
 // ------------------------------------------------------------
+// Registro cruzado de la llamada (retorno del visor → puerta)
+// ------------------------------------------------------------
+async function handlePair(request, url) {
+	pruneExpiredPairs();
+
+	if (url.pathname === "/pair" && request.method === "POST") {
+		// El visor que contestó publica su sesión de retorno.
+		// body: { door: "puerta1", session: "<sessionId retorno>", tracks: ["video","audio"] }
+		let data = {};
+		try {
+			data = await request.json();
+		} catch (e) {
+			return json(400, { success: false, error: "JSON inválido en /pair" });
+		}
+		const door = String(data.door || "").trim();
+		const session = String(data.session || "").trim();
+		if (!door || !session) {
+			return json(400, {
+				success: false,
+				error: "Faltan door y/o session en /pair",
+			});
+		}
+		const tracks = Array.isArray(data.tracks) ? data.tracks.map(String) : ["video", "audio"];
+		returnRegistry.set(door, { returnSession: session, tracks, at: Date.now() });
+		return json(200, { success: true, door, paired: true });
+	}
+
+	if (url.pathname === "/pair-status") {
+		// La puerta consulta si el visor ya contestó.
+		const door = url.searchParams.get("door");
+		if (door) {
+			const entry = returnRegistry.get(door);
+			if (entry && Date.now() - entry.at <= PAIR_TTL_MS) {
+				return json(200, {
+					success: true,
+					active: true,
+					returnSession: entry.returnSession,
+					tracks: entry.tracks || ["video", "audio"],
+				});
+			}
+			returnRegistry.delete(door);
+		}
+		return json(200, { success: true, active: false });
+	}
+
+	if (url.pathname === "/pair-cancel") {
+		// La puerta libera la sesión de retorno al terminar la llamada.
+		const door = url.searchParams.get("door");
+		if (door) returnRegistry.delete(door);
+		return json(200, { success: true, released: true });
+	}
+
+	return json(404, { success: false, error: "Ruta de pairing no encontrada" });
+}
+
+// ------------------------------------------------------------
 // Envío de mensajes a Telegram (con botón de enlace opcional)
 // ------------------------------------------------------------
 async function sendTelegram(env, text, opts = {}) {
@@ -148,14 +224,25 @@ export default {
 		}
 
 		// ==========================================================
-		// 1. Proxy Realtime SFU (Cloudflare Calls)
+		// 1. Registro de llamada bidireccional (retorno del visor)
+		// ==========================================================
+		if (
+			url.pathname === "/pair" ||
+			url.pathname === "/pair-status" ||
+			url.pathname === "/pair-cancel"
+		) {
+			return handlePair(request, url);
+		}
+
+		// ==========================================================
+		// 2. Proxy Realtime SFU (Cloudflare Calls)
 		// ==========================================================
 		if (url.pathname.startsWith("/calls/")) {
 			return proxyCallsRequest(request, url, callsEnv(env));
 		}
 
 		// ==========================================================
-		// 2. Solo permitir POST (resto de endpoints).
+		// 3. Solo permitir POST (resto de endpoints).
 		// ==========================================================
 		if (request.method !== "POST") {
 			return new Response("Método no permitido", {
