@@ -1,7 +1,7 @@
 export default {
   async fetch(request, env) {
     // ============================================================
-    // 1. CORS
+    // 1. CORS v.1.1
     // ============================================================
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
