@@ -1,253 +1,387 @@
+// ============================================================
+// Puerta 1 / Ecuador 1438 — Cloudflare Worker (v1.2)
+// ------------------------------------------------------------
+// 1. Notificaciones por Telegram (timbre, formulario)
+// 2. Proxy Realtime SFU de Cloudflare Calls (/calls/*) para la
+//    videollamada del citófono. Replica routePartyTracksRequest
+//    de partytracks (motor que usa Cloudflare Meet).
+// ============================================================
+
+const CALLS_BASE = "https://rtc.live.cloudflare.com/v1";
+
+const CORS_HEADERS = {
+	"Access-Control-Allow-Origin": "*",
+	"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+	"Access-Control-Allow-Headers": "Content-Type",
+};
+
+function withCors(headers = new Headers()) {
+	const h = new Headers(headers);
+	h.set("Access-Control-Allow-Origin", "*");
+	h.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+	h.set("Access-Control-Allow-Headers", "Content-Type");
+	return h;
+}
+
+function json(status, obj, extraHeaders) {
+	return new Response(JSON.stringify(obj), {
+		status,
+		headers: {
+			"Content-Type": "application/json",
+			...CORS_HEADERS,
+			...(extraHeaders || {}),
+		},
+	});
+}
+
+// Resuelve las credenciales de Calls/SFU permitiendo ambos nombres:
+//   ID_app / Token_API   (los que te entregó SFU)
+//   CALLS_APP_ID / CALLS_APP_SECRET  (los convencionales de Cloudflare Meet)
+function callsEnv(env) {
+	return {
+		appId: env.CALLS_APP_ID || env.ID_app,
+		appSecret: env.CALLS_APP_SECRET || env.Token_API,
+		apiBase: env.CALLS_API_URL || CALLS_BASE,
+		turnId: env.SFU_TURN_SERVICE_ID || env.TURN_SERVICE_ID,
+		turnToken: env.SFU_TURN_SERVICE_TOKEN || env.TURN_SERVICE_TOKEN,
+	};
+}
+
+// ------------------------------------------------------------
+// Proxy Realtime SFU (equivalente a partytracks/server)
+// Enruta cualquier /calls/... hacia la API de Cloudflare Calls,
+// inyectando la autorización con el app secret (nunca llega al
+// navegador). Mismo protocolo que usa la página de partytracks
+// de meet-main: sesiones, tracks (push/pull), renegociación.
+// ------------------------------------------------------------
+async function proxyCallsRequest(request, url, cf) {
+	if (!cf.appId || !cf.appSecret) {
+		return json(500, {
+			success: false,
+			error:
+				"Faltan las credenciales de Cloudflare Calls en el Worker: ID_app (o CALLS_APP_ID) y Token_API (o CALLS_APP_SECRET).",
+		});
+	}
+
+	// Ruta relativa desde el proxy (/calls/...)
+	const rest = url.pathname.slice("/calls".length);
+
+	// Servidores ICE para el navegador (STUN público o credenciales TURN)
+	if (rest.startsWith("/generate-ice-servers")) {
+		if (cf.turnId && cf.turnToken) {
+			const turnRes = await fetch(
+				`${cf.apiBase}/turn/keys/${cf.turnId}/credentials/generate-ice-servers`,
+				{
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${cf.turnToken}`,
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({ ttl: 86400 }),
+				}
+			);
+			return new Response(await turnRes.text(), {
+				status: turnRes.status,
+				headers: withCors(turnRes.headers),
+			});
+		}
+		return json(200, {
+			iceServers: [
+				{
+					urls: ["stun:stun.cloudflare.com:3478", "stun:stun.cloudflare.com:53"],
+				},
+			],
+		});
+	}
+
+	const target = new URL(`${cf.apiBase}/apps/${cf.appId}${rest}`);
+	target.search = url.search;
+
+	const headers = new Headers(request.headers);
+	headers.set("Authorization", `Bearer ${cf.appSecret}`);
+	headers.set("Content-Type", "application/json");
+
+	const init = { method: request.method, headers };
+	if (request.method !== "GET" && request.method !== "HEAD") {
+		const body = await request.text();
+		if (body) init.body = body;
+	}
+
+	const upstream = await fetch(target, init);
+	return new Response(await upstream.text(), {
+		status: upstream.status,
+		statusText: upstream.statusText,
+		headers: withCors(upstream.headers),
+	});
+}
+
+// ------------------------------------------------------------
+// Envío de mensajes a Telegram (con botón de enlace opcional)
+// ------------------------------------------------------------
+async function sendTelegram(env, text, opts = {}) {
+	const payload = { chat_id: env.TELEGRAM_CHAT_ID, text };
+	if (opts.parseMode) payload.parse_mode = opts.parseMode;
+	if (opts.url) {
+		payload.reply_markup = {
+			inline_keyboard: [[{ text: "🎥 Ver cámara en vivo", url: opts.url }]],
+		};
+	}
+	return fetch(
+		`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(payload),
+		}
+	);
+}
+
 export default {
-  async fetch(request, env) {
-    // ============================================================
-    // 1. CORS v.1.1
-    // ============================================================
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    };
+	async fetch(request, env) {
+		const url = new URL(request.url);
 
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
-    }
+		// ==========================================================
+		// 0. CORS v1.2
+		// ==========================================================
+		if (request.method === "OPTIONS") {
+			return new Response(null, { headers: withCors() });
+		}
 
-    // ============================================================
-    // 2. Solo permitir POST.
-    // ============================================================
-    if (request.method !== "POST") {
-      return new Response("Método no permitido", {
-        status: 405,
-        headers: corsHeaders
-      });
-    }
+		// ==========================================================
+		// 1. Proxy Realtime SFU (Cloudflare Calls)
+		// ==========================================================
+		if (url.pathname.startsWith("/calls/")) {
+			return proxyCallsRequest(request, url, callsEnv(env));
+		}
 
-    try {
-      // ==========================================================
-      // 3. Verificar Secrets de Telegram
-      // ==========================================================
-      if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en Cloudflare"
-          }),
-          {
-            status: 500,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
-          }
-        );
-      }
+		// ==========================================================
+		// 2. Solo permitir POST (resto de endpoints).
+		// ==========================================================
+		if (request.method !== "POST") {
+			return new Response("Método no permitido", {
+				status: 405,
+				headers: withCors(),
+			});
+		}
 
-      // ==========================================================
-      // 4. Detectar el tipo de contenido y extraer datos
-      // ==========================================================
-      const contentType = request.headers.get("content-type") || "";
+		try {
+			// ========================================================
+			// 3. Verificar Secrets de Telegram
+			// ========================================================
+			if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+				return json(500, {
+					success: false,
+					error: "Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en Cloudflare",
+				});
+			}
 
-      let tipo = "";
-      let nombre = "No especificado";
-      let email = "No especificado";
-      let telefono = "No especificado";
-      let mensajeUsuario = "Sin contenido";
-      let foto = null;
+			// ========================================================
+			// 4. Detectar el tipo de contenido y extraer datos
+			// ========================================================
+			const contentType = request.headers.get("content-type") || "";
 
-      if (contentType.includes("multipart/form-data")) {
-        const formData = await request.formData();
-        tipo = formData.get("tipo") || "";
-        nombre = formData.get("nombre") || "No especificado";
-        email = formData.get("email") || "No especificado";
-        telefono = formData.get("telefono") || "No especificado";
-        mensajeUsuario = formData.get("mensaje") || "Sin contenido";
+			let tipo = "";
+			let nombre = "No especificado";
+			let email = "No especificado";
+			let telefono = "No especificado";
+			let mensajeUsuario = "Sin contenido";
+			let foto = null;
+			let viewUrl = "";
 
-        const archivo = formData.get("foto");
-        if (archivo instanceof File && archivo.size > 0) {
-          foto = archivo;
-        }
-      } else if (contentType.includes("application/json")) {
-        const data = await request.json();
-        tipo = data.tipo || "";
-        nombre = data.nombre || "No especificado";
-        email = data.email || "No especificado";
-        telefono = data.telefono || "No especificado";
-        mensajeUsuario = data.mensaje || "Sin contenido";
-      } else {
-        try {
-          const text = await request.text();
-          const params = new URLSearchParams(text);
-          tipo = params.get("tipo") || "";
-          nombre = params.get("nombre") || "No especificado";
-          email = params.get("email") || "No especificado";
-          telefono = params.get("telefono") || "No especificado";
-          mensajeUsuario = params.get("mensaje") || "Sin contenido";
-        } catch (e) {}
-      }
+			if (contentType.includes("multipart/form-data")) {
+				const formData = await request.formData();
+				tipo = formData.get("tipo") || "";
+				nombre = formData.get("nombre") || "No especificado";
+				email = formData.get("email") || "No especificado";
+				telefono = formData.get("telefono") || "No especificado";
+				mensajeUsuario = formData.get("mensaje") || "Sin contenido";
+				viewUrl = formData.get("viewUrl") || "";
 
-      // ==========================================================
-      // 5. SI ES UN TOQUE DE TIMBRE
-      // ==========================================================
-      if (tipo === "timbre") {
-        const ahora = Date.now();
-        const clave = "puerta1_timbre";
-        let cantidad = 0;
-        let inicioBloqueo = null;
-        const treintaMinutos = 30 * 60 * 1000;
+				const archivo = formData.get("foto");
+				if (archivo instanceof File && archivo.size > 0) {
+					foto = archivo;
+				}
+			} else if (contentType.includes("application/json")) {
+				const data = await request.json();
+				tipo = data.tipo || "";
+				nombre = data.nombre || "No especificado";
+				email = data.email || "No especificado";
+				telefono = data.telefono || "No especificado";
+				mensajeUsuario = data.mensaje || "Sin contenido";
+				viewUrl = data.viewUrl || "";
+			} else {
+				try {
+					const text = await request.text();
+					const params = new URLSearchParams(text);
+					tipo = params.get("tipo") || "";
+					nombre = params.get("nombre") || "No especificado";
+					email = params.get("email") || "No especificado";
+					telefono = params.get("telefono") || "No especificado";
+					mensajeUsuario = params.get("mensaje") || "Sin contenido";
+					viewUrl = params.get("viewUrl") || "";
+				} catch (e) {}
+			}
 
-        // Si TIMBRE_KV está configurado en Cloudflare, gestionar límites
-        if (env.TIMBRE_KV) {
-          try {
-            const estado = await env.TIMBRE_KV.get(clave, "json");
-            if (estado) {
-              cantidad = estado.cantidad || 0;
-              inicioBloqueo = estado.inicioBloqueo || null;
-            }
-          } catch (e) {
-            console.error("Error al leer de KV:", e);
-          }
+			const puerta = url.searchParams.get("puerta") || "1";
 
-          // Comprobar si todavía está dentro de los 30 minutos de bloqueo
-          if (inicioBloqueo) {
-            const transcurrido = ahora - inicioBloqueo;
-            if (transcurrido < treintaMinutos) {
-              const restanteMs = treintaMinutos - transcurrido;
-              const restanteMinutos = Math.ceil(restanteMs / 60000);
+			// ========================================================
+			// 5. SI ES UN TOQUE DE TIMBRE
+			// ========================================================
+			if (tipo === "timbre") {
+				const ahora = Date.now();
+				const clave = "puerta1_timbre";
+				let cantidad = 0;
+				let inicioBloqueo = null;
+				const treintaMinutos = 30 * 60 * 1000;
 
-              return new Response(
-                JSON.stringify({
-                  success: false,
-                  tipo: "timbre",
-                  bloqueado: true,
-                  minutos_restantes: restanteMinutos,
-                  error: `Timbre bloqueado. Faltan ${restanteMinutos} minutos para volver a utilizarlo.`
-                }),
-                {
-                  status: 429,
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...corsHeaders
-                  }
-                }
-              );
-            }
-            // Ya pasaron los 30 minutos. Reiniciar contador.
-            cantidad = 0;
-            inicioBloqueo = null;
-          }
+				// Si TIMBRE_KV está configurado en Cloudflare, gestionar límites
+				if (env.TIMBRE_KV) {
+					try {
+						const estado = await env.TIMBRE_KV.get(clave, "json");
+						if (estado) {
+							cantidad = estado.cantidad || 0;
+							inicioBloqueo = estado.inicioBloqueo || null;
+						}
+					} catch (e) {
+						console.error("Error al leer de KV:", e);
+					}
 
-          // Seguridad: máximo 3 toques
-          if (cantidad >= 3) {
-            return new Response(
-              JSON.stringify({
-                success: false,
-                tipo: "timbre",
-                bloqueado: true,
-                minutos_restantes: 30,
-                error: "Se alcanzó el límite de 3 toques. El timbre estará disponible nuevamente en 30 minutos."
-              }),
-              {
-                status: 429,
-                headers: {
-                  "Content-Type": "application/json",
-                  ...corsHeaders
-                }
-              }
-            );
-          }
+					// Comprobar si todavía está dentro de los 30 minutos de bloqueo
+					if (inicioBloqueo) {
+						const transcurrido = ahora - inicioBloqueo;
+						if (transcurrido < treintaMinutos) {
+							const restanteMs = treintaMinutos - transcurrido;
+							const restanteMinutos = Math.ceil(restanteMs / 60000);
 
-          // Registrar el nuevo toque
-          cantidad++;
-          if (cantidad === 3) {
-            inicioBloqueo = ahora;
-          }
+							return json(429, {
+								success: false,
+								tipo: "timbre",
+								bloqueado: true,
+								minutos_restantes: restanteMinutos,
+								error: `Timbre bloqueado. Faltan ${restanteMinutos} minutos para volver a utilizarlo.`,
+							});
+						}
+						// Ya pasaron los 30 minutos. Reiniciar contador.
+						cantidad = 0;
+						inicioBloqueo = null;
+					}
 
-          try {
-            await env.TIMBRE_KV.put(
-              clave,
-              JSON.stringify({
-                cantidad: cantidad,
-                inicioBloqueo: inicioBloqueo
-              })
-            );
-          } catch (e) {
-            console.error("Error al guardar en KV:", e);
-          }
-        } else {
-          // Si no está configurado TIMBRE_KV aún, enviar el mensaje sin bloquear la app
-          cantidad = 1;
-        }
+					// Seguridad: máximo 3 toques
+					if (cantidad >= 3) {
+						return json(429, {
+							success: false,
+							tipo: "timbre",
+							bloqueado: true,
+							minutos_restantes: 30,
+							error:
+								"Se alcanzó el límite de 3 toques. El timbre estará disponible nuevamente en 30 minutos.",
+						});
+					}
 
-        // ========================================================
-        // Mensaje de Telegram formateado con campanitas
-        // ========================================================
-        let textoTimbre = `🔔🔔🔔🔔🔔🔔🔔🔔🔔\n\n*🔔ESTÁN TOCANDO EL TIMBRE🔔*`;
+					// Registrar el nuevo toque
+					cantidad++;
+					if (cantidad === 3) {
+						inicioBloqueo = ahora;
+					}
 
-        if (cantidad === 3) {
-          textoTimbre += `\n\n⚠️ Se alcanzó el límite de 3 toques.`;
-          textoTimbre += `\n⏳ Podrá volver a tocarse en 30 minutos.`;
-        }
+					try {
+						await env.TIMBRE_KV.put(
+							clave,
+							JSON.stringify({
+								cantidad: cantidad,
+								inicioBloqueo: inicioBloqueo,
+							})
+						);
+					} catch (e) {
+						console.error("Error al guardar en KV:", e);
+					}
+				} else {
+					// Si no está configurado TIMBRE_KV aún, enviar el mensaje sin bloquear la app
+					cantidad = 1;
+				}
 
-        const telegramUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+				// ====================================================
+				// Mensaje de Telegram formateado con campanitas
+				// ====================================================
+				let textoTimbre = `🔔🔔🔔🔔🔔🔔🔔🔔🔔\n\n*🔔ESTÁN TOCANDO EL TIMBRE🔔*`;
 
-        const response = await fetch(telegramUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            chat_id: env.TELEGRAM_CHAT_ID,
-            text: textoTimbre,
-            parse_mode: "Markdown"
-          })
-        });
+				if (cantidad === 3) {
+					textoTimbre += `\n\n⚠️ Se alcanzó el límite de 3 toques.`;
+					textoTimbre += `\n⏳ Podrá volver a tocarse en 30 minutos.`;
+				}
 
-        const telegramResult = await response.json();
+				// Si hay una cámara transmitiendo, adjuntar el enlace
+				const telegramOpts = { parseMode: "Markdown" };
+				if (viewUrl) {
+					textoTimbre += `\n\n🎥 *Cámara de la puerta:*
+${viewUrl}`;
+					telegramOpts.url = viewUrl;
+				}
 
-        if (!response.ok) {
-          return new Response(
-            JSON.stringify({
-              success: false,
-              error: "Error al enviar el timbre a Telegram",
-              telegram_status: response.status,
-              telegram_response: telegramResult
-            }),
-            {
-              status: 500,
-              headers: {
-                "Content-Type": "application/json",
-                ...corsHeaders
-              }
-            }
-          );
-        }
+				const response = await sendTelegram(env, textoTimbre, telegramOpts);
+				const telegramResult = await response.json();
 
-        return new Response(
-          JSON.stringify({
-            success: true,
-            tipo: "timbre",
-            bloqueado: cantidad === 3,
-            toques_realizados: cantidad,
-            mensaje:
-              cantidad === 3
-                ? "Timbre sonando. Límite alcanzado. Disponible nuevamente en 30 minutos."
-                : "Timbre sonando."
-          }),
-          {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
-          }
-        );
-      }
+				if (!response.ok) {
+					return json(500, {
+						success: false,
+						error: "Error al enviar el timbre a Telegram",
+						telegram_status: response.status,
+						telegram_response: telegramResult,
+					});
+				}
 
-      // ==========================================================
-      // 6. SI NO ES TIMBRE → FORMULARIO
-      // ==========================================================
-      const textoMensaje = `🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽
+				return json(200, {
+					success: true,
+					tipo: "timbre",
+					bloqueado: cantidad === 3,
+					toques_realizados: cantidad,
+					mensaje:
+						cantidad === 3
+							? "Timbre sonando. Límite alcanzado. Disponible nuevamente en 30 minutos."
+							: "Timbre sonando.",
+				});
+			}
+
+			// ========================================================
+			// 6. SI ES UNA TRANSMISIÓN EN VIVO (aviso de cámara)
+			// ========================================================
+			if (tipo === "transmision") {
+				let textoTransmision = `📡📡📡📡📡📡📡
+
+*🔴 TRANSMISIÓN EN VIVO — Puerta ${puerta}*
+
+🎥 La cámara está transmitiendo. Haz clic en el botón de abajo para verla al instante.`;
+
+				const telegramOpts = { parseMode: "Markdown" };
+				if (viewUrl) {
+					textoTransmision += `\n\n📎 Enlace: ${viewUrl}`;
+					telegramOpts.url = viewUrl;
+				}
+
+				const response = await sendTelegram(env, textoTransmision, telegramOpts);
+				const telegramResult = await response.json();
+
+				if (!response.ok) {
+					return json(500, {
+						success: false,
+						error: "Error al enviar la transmisión a Telegram",
+						telegram_status: response.status,
+						telegram_response: telegramResult,
+					});
+				}
+
+				return json(200, {
+					success: true,
+					tipo: "transmision",
+					viewUrl,
+					result: telegramResult,
+				});
+			}
+
+			// ========================================================
+			// 7. SI NO ES TIMBRE NI TRANSMISIÓN → FORMULARIO
+			// ========================================================
+			const textoMensaje = `🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽🔽
 
 📩 NUEVO MENSAJE
 
@@ -261,81 +395,53 @@ export default {
 
 ${mensajeUsuario}`;
 
-      const telegramBaseUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
-      let response;
+			const telegramBaseUrl = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}`;
+			let response;
 
-      if (foto) {
-        const telegramForm = new FormData();
-        telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
-        telegramForm.append("caption", textoMensaje);
-        telegramForm.append("photo", foto, foto.name || "foto.jpg");
+			if (foto) {
+				const telegramForm = new FormData();
+				telegramForm.append("chat_id", env.TELEGRAM_CHAT_ID);
+				telegramForm.append("caption", textoMensaje);
+				telegramForm.append("photo", foto, foto.name || "foto.jpg");
 
-        response = await fetch(`${telegramBaseUrl}/sendPhoto`, {
-          method: "POST",
-          body: telegramForm
-        });
-      } else {
-        response = await fetch(`${telegramBaseUrl}/sendMessage`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            chat_id: env.TELEGRAM_CHAT_ID,
-            text: textoMensaje
-          })
-        });
-      }
+				response = await fetch(`${telegramBaseUrl}/sendPhoto`, {
+					method: "POST",
+					body: telegramForm,
+				});
+			} else {
+				response = await fetch(`${telegramBaseUrl}/sendMessage`, {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+					},
+					body: JSON.stringify({
+						chat_id: env.TELEGRAM_CHAT_ID,
+						text: textoMensaje,
+					}),
+				});
+			}
 
-      const telegramResult = await response.json();
+			const telegramResult = await response.json();
 
-      if (!response.ok) {
-        return new Response(
-          JSON.stringify({
-            success: false,
-            error: "Error al enviar el formulario a Telegram",
-            telegram_status: response.status,
-            telegram_response: telegramResult
-          }),
-          {
-            status: 500,
-            headers: {
-              "Content-Type": "application/json",
-              ...corsHeaders
-            }
-          }
-        );
-      }
+			if (!response.ok) {
+				return json(500, {
+					success: false,
+					error: "Error al enviar el formulario a Telegram",
+					telegram_status: response.status,
+					telegram_response: telegramResult,
+				});
+			}
 
-      return new Response(
-        JSON.stringify({
-          success: true,
-          tipo: "formulario",
-          result: telegramResult
-        }),
-        {
-          status: 200,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders
-          }
-        }
-      );
-
-    } catch (error) {
-      return new Response(
-        JSON.stringify({
-          success: false,
-          error: error.message
-        }),
-        {
-          status: 500,
-          headers: {
-            "Content-Type": "application/json",
-            ...corsHeaders
-          }
-        }
-      );
-    }
-  }
+			return json(200, {
+				success: true,
+				tipo: "formulario",
+				result: telegramResult,
+			});
+		} catch (error) {
+			return json(500, {
+				success: false,
+				error: error.message,
+			});
+		}
+	},
 };

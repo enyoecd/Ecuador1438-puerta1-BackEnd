@@ -4,11 +4,22 @@
   "main": "worker.js",
   "compatibility_date": "2026-09-09"
 
-  // ── Secrets (NO van en este archivo; cárgalos con la CLI o el dashboard):
+  // ── Secrets Telegram (NO van en este archivo; cárgalos con la CLI o el dashboard):
   //      wrangler secret put TELEGRAM_BOT_TOKEN
   //      wrangler secret put TELEGRAM_CHAT_ID
   //    TELEGRAM_BOT_TOKEN → Token del bot de Telegram
   //    TELEGRAM_CHAT_ID   → Chat/ID de destino en Telegram
+
+  // ── Credenciales Cloudflare Calls / Realtime SFU (los entregados por SFU):
+  //    Se aceptan ambos nombres (el Worker resuelve con fallback):
+  //      wrangler secret put ID_app            → App/Application ID de Cloudflare Calls
+  //      wrangler secret put Token_API         → App Secret (API Token) de Cloudflare Calls
+  //    o los nombres convencionales de Cloudflare Meet:
+  //      wrangler secret put CALLS_APP_ID
+  //      wrangler secret put CALLS_APP_SECRET
+  //    TURN opcional (recomendado para redes estrictas):
+  //      wrangler secret put SFU_TURN_SERVICE_ID
+  //      wrangler secret put SFU_TURN_SERVICE_TOKEN
 
   // ── KV opcional (recomendado) para límites del timbre:
   //    "kv_namespaces": [
