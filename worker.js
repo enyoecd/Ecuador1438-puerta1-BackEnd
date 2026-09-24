@@ -187,6 +187,7 @@ export default {
 			let mensajeUsuario = "Sin contenido";
 			let foto = null;
 			let viewUrl = "";
+			let puertaForm = "";
 
 			if (contentType.includes("multipart/form-data")) {
 				const formData = await request.formData();
@@ -196,6 +197,7 @@ export default {
 				telefono = formData.get("telefono") || "No especificado";
 				mensajeUsuario = formData.get("mensaje") || "Sin contenido";
 				viewUrl = formData.get("viewUrl") || "";
+				puertaForm = formData.get("puerta") || "";
 
 				const archivo = formData.get("foto");
 				if (archivo instanceof File && archivo.size > 0) {
@@ -209,6 +211,7 @@ export default {
 				telefono = data.telefono || "No especificado";
 				mensajeUsuario = data.mensaje || "Sin contenido";
 				viewUrl = data.viewUrl || "";
+				puertaForm = data.puerta || "";
 			} else {
 				try {
 					const text = await request.text();
@@ -219,10 +222,11 @@ export default {
 					telefono = params.get("telefono") || "No especificado";
 					mensajeUsuario = params.get("mensaje") || "Sin contenido";
 					viewUrl = params.get("viewUrl") || "";
+					puertaForm = params.get("puerta") || "";
 				} catch (e) {}
 			}
 
-			const puerta = url.searchParams.get("puerta") || "1";
+			const puerta = url.searchParams.get("puerta") || puertaForm || "1";
 
 			// ========================================================
 			// 5. SI ES UN TOQUE DE TIMBRE
