@@ -21,8 +21,16 @@
   //      wrangler secret put SFU_TURN_SERVICE_ID
   //      wrangler secret put SFU_TURN_SERVICE_TOKEN
 
-  // ── KV opcional (recomendado) para límites del timbre:
+  // ── KV opcional (recomendado) para límites del timbre y para el
+  //    emparejamiento de la videollamada (viewer ↔ puerta):
   //    "kv_namespaces": [
-  //      { "binding": "TIMBRE_KV", "id": "ID_NAMESPACE_TIMBRE" }
+  //      { "binding": "TIMBRE_KV", "id": "ID_NAMESPACE_TIMBRE" },
+  //      { "binding": "PAIR_KV",   "id": "ID_NAMESPACE_PAIR"   }
   //    ]
+  //    El Worker usa PAIR_KV para /pair* y, si no existe, cae a
+  //    TIMBRE_KV. Sin ninguna de las dos sigue funcionando, pero el
+  //    emparejamiento queda solo en memoria del isolate y se pierde
+  //    cuando Cloudflare enruta el POST del visor y el GET de la
+  //    puerta a isolates distintos (llamada inversa intermitente).
+  //    Crear la namespace:  wrangler kv namespace create PAIR_KV
 }

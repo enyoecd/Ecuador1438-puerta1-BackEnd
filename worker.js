@@ -16,17 +16,122 @@ const CALLS_BASE = "https://rtc.live.cloudflare.com/v1";
 //   valor  → { returnSession, tracks, at }
 // El visor publica su sesión de retorno con POST /pair y la
 // puerta la consulta (long-poll simple) con GET /pair-status.
-// El estado es en memoria: suficiente para una puerta. Si se
-// necesita durabilidad real, migra esto a un Durable Object.
+//
+// El mapa en memoria es una COPIA de respaldo: cada isolate de
+// Workers tiene el suyo y Cloudflare puede enrutar el POST del
+// visor y el GET de la puerta a isolates distintos (o dormir el
+// que los guardaba), con lo que el emparejamiento se perdía sin
+// aviso. Por eso la fuente de verdad es KV (PAIR_KV, o
+// TIMBRE_KV si no se crea una namespace propia) y la memoria solo
+// acelera las lecturas. Con un solo par de dispositivos el
+//emparejamiento tiene que sobrevivir a un Worker frío.
 // ============================================================
 const returnRegistry = new Map();
 const PAIR_TTL_MS = 12 * 60 * 60 * 1000; // 12 h
+const PAIR_KV_TTL_S = 60 * 60; // 1 h (mínimo de KV: 60 s)
+const PAIR_MAX_WAIT_MS = 20000; // techo del long-poll
+const PAIR_POLL_MS = 1200; // lecturas de KV durante la espera
+
+function pairKey(door) {
+  return "pair:" + String(door).trim().toLowerCase();
+}
+
+function pairStore(env) {
+  return env.PAIR_KV || env.TIMBRE_KV || null;
+}
 
 function pruneExpiredPairs() {
 	const now = Date.now();
 	for (const [key, entry] of returnRegistry) {
 		if (now - entry.at > PAIR_TTL_MS) returnRegistry.delete(key);
 	}
+}
+
+// ── Lectura: memoria primero, KV como respaldo ─────────────
+async function readPair(env, door) {
+	const key = pairKey(door);
+	const now = Date.now();
+
+	const local = returnRegistry.get(key);
+	if (local) {
+		if (now - local.at <= PAIR_TTL_MS) return local;
+		returnRegistry.delete(key);
+	}
+
+	const kv = pairStore(env);
+	if (!kv) return null;
+	try {
+		const entry = await kv.get(key, "json");
+		if (!entry) return null;
+		if (now - (entry.at || 0) > PAIR_TTL_MS) {
+			// Entrada caduca: se limpia para no devolver sesiones muertas.
+			try {
+				await kv.delete(key);
+			} catch (e) {}
+			return null;
+		}
+		// Se refleja en memoria para no volver a pegarle a KV.
+		returnRegistry.set(key, entry);
+		return entry;
+	} catch (e) {
+		console.error("Error al leer el pairing de KV:", e);
+		return null;
+	}
+}
+
+async function writePair(env, door, entry) {
+	const key = pairKey(door);
+	returnRegistry.set(key, entry);
+	const kv = pairStore(env);
+	if (!kv) return;
+	try {
+		await kv.put(key, JSON.stringify(entry), { expirationTtl: PAIR_KV_TTL_S });
+	} catch (e) {
+		console.error("Error al guardar el pairing en KV:", e);
+	}
+}
+
+async function deletePair(env, door, onlySession) {
+	const key = pairKey(door);
+	const kv = pairStore(env);
+	let entry = returnRegistry.get(key) || null;
+	if (!entry && kv) {
+		try {
+			entry = await kv.get(key, "json");
+		} catch (e) {
+			console.error("Error al leer el pairing de KV:", e);
+		}
+	}
+	// Con ?session solo se suelta si sigue siendo el mismo emparejamiento:
+	// así una pantalla que se cierra no tumba la llamada de otro visor que
+	// ya haya tomado el relevo.
+	if (onlySession && entry && entry.returnSession !== onlySession) return;
+
+	returnRegistry.delete(key);
+	if (!kv) return;
+	try {
+		await kv.delete(key);
+	} catch (e) {
+		console.error("Error al borrar el pairing de KV:", e);
+	}
+}
+
+// Espera activa: mantiene la respuesta hasta que el visor se
+// empareja o se agota el tiempo. Menos peticiones que el sondeo
+// corto y, sobre todo, la puerta se entera en el acto en lugar de
+// esperar al siguiente tick.
+async function waitForPair(env, door, waitMs) {
+	const deadline = Date.now() + waitMs;
+	// Primer golpe sin esperar: el registro puede haberse escrito
+	// justo después de la última respuesta.
+	let entry = await readPair(env, door);
+	while (!entry && Date.now() < deadline) {
+		const remain = deadline - Date.now();
+		if (remain <= 0) break;
+		await new Promise((r) => setTimeout(r, Math.min(PAIR_POLL_MS, remain)));
+		entry = await readPair(env, door);
+	}
+	return entry;
 }
 
 const CORS_HEADERS = {
@@ -138,7 +243,7 @@ async function proxyCallsRequest(request, url, cf) {
 // ------------------------------------------------------------
 // Registro cruzado de la llamada (retorno del visor → puerta)
 // ------------------------------------------------------------
-async function handlePair(request, url) {
+async function handlePair(request, url, env) {
 	pruneExpiredPairs();
 
 	if (url.pathname === "/pair" && request.method === "POST") {
@@ -158,17 +263,32 @@ async function handlePair(request, url) {
 				error: "Faltan door y/o session en /pair",
 			});
 		}
-		const tracks = Array.isArray(data.tracks) ? data.tracks.map(String) : ["video", "audio"];
-		returnRegistry.set(door, { returnSession: session, tracks, at: Date.now() });
-		return json(200, { success: true, door, paired: true });
+		const tracks = Array.isArray(data.tracks)
+			? data.tracks.map(String).filter(Boolean)
+			: ["video", "audio"];
+		const entry = {
+			returnSession: session,
+			tracks: tracks.length ? tracks : ["video", "audio"],
+			at: Date.now(),
+		};
+		await writePair(env, door, entry);
+		return json(200, { success: true, door, paired: true, tracks: entry.tracks });
 	}
 
 	if (url.pathname === "/pair-status") {
 		// La puerta consulta si el visor ya contestó.
-		const door = url.searchParams.get("door");
+		// ?wait=<ms> deja la petición abierta hasta que haya respuesta.
+		const door = String(url.searchParams.get("door") || "").trim();
 		if (door) {
-			const entry = returnRegistry.get(door);
-			if (entry && Date.now() - entry.at <= PAIR_TTL_MS) {
+			let waitMs = parseInt(url.searchParams.get("wait") || "0", 10);
+			if (!Number.isFinite(waitMs) || waitMs < 0) waitMs = 0;
+			waitMs = Math.min(waitMs, PAIR_MAX_WAIT_MS);
+
+			let entry = await readPair(env, door);
+			if (!entry && waitMs > 0) {
+				entry = await waitForPair(env, door, waitMs);
+			}
+			if (entry) {
 				return json(200, {
 					success: true,
 					active: true,
@@ -176,15 +296,17 @@ async function handlePair(request, url) {
 					tracks: entry.tracks || ["video", "audio"],
 				});
 			}
-			returnRegistry.delete(door);
 		}
 		return json(200, { success: true, active: false });
 	}
 
 	if (url.pathname === "/pair-cancel") {
-		// La puerta libera la sesión de retorno al terminar la llamada.
-		const door = url.searchParams.get("door");
-		if (door) returnRegistry.delete(door);
+		// La puerta o el visor liberan la sesión de retorno.
+		// Con ?session solo se suelta si sigue siendo la misma, para que
+		// una pantalla que se cierra no tumbe la llamada de otra.
+		const door = String(url.searchParams.get("door") || "").trim();
+		const session = String(url.searchParams.get("session") || "").trim();
+		if (door) await deletePair(env, door, session || null);
 		return json(200, { success: true, released: true });
 	}
 
@@ -231,7 +353,7 @@ export default {
 			url.pathname === "/pair-status" ||
 			url.pathname === "/pair-cancel"
 		) {
-			return handlePair(request, url);
+			return handlePair(request, url, env);
 		}
 
 		// ==========================================================
