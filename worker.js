@@ -1,31 +1,50 @@
 // ============================================================
-// Puerta 1 / Ecuador 1438 — Cloudflare Worker (v1.2)
+// Puerta 1 / Ecuador 1438 — Cloudflare Worker (v1.3)
 // ------------------------------------------------------------
 // 1. Notificaciones por Telegram (timbre, formulario)
 // 2. Proxy Realtime SFU de Cloudflare Calls (/calls/*) para la
 //    videollamada del citófono. Replica routePartyTracksRequest
 //    de partytracks (motor que usa Cloudflare Meet).
+// 3. Registro de llamadas cruzadas (pairing) en un Durable
+//    Object: estado consistente para la videollamada bidireccional.
 // ============================================================
 
 const CALLS_BASE = "https://rtc.live.cloudflare.com/v1";
 
 // ============================================================
-// Registro en memoria de llamadas cruzadas (pairing) para la
-// videollamada bidireccional (WHEP/WHIP simultáneo).
+// Registro de llamadas cruzadas (pairing) para la videollamada
+// bidireccional (WHEP/WHIP simultáneo).
 //   clave  → ID estable de puerta (p. ej. "puerta1")
-//   valor  → { returnSession, tracks, at }
+//   valor  → { ret: {session, tracks, at}, stream: {session, tracks, at} }
 // El visor publica su sesión de retorno con POST /pair y la
-// puerta la consulta (long-poll simple) con GET /pair-status.
-// El estado es en memoria: suficiente para una puerta. Si se
-// necesita durabilidad real, migra esto a un Durable Object.
+// puerta la consulta con GET /pair-status.
+//
+// IMPORTANTE: un Worker sin estado puede atender el POST /pair
+// y el GET /pair-status en isolates DISTINTOS, así que un Map en
+// memoria perdía el emparejamiento de forma intermitente. Por eso
+// el estado vive en un Durable Object (un solo isolate, con
+// almacenamiento por clave). Mientras el binding no exista
+// (migración aún no desplegada) se usa el Map en memoria para no
+// romper nada, aceptando la intermitencia.
+//
+// Rutas:
+//   POST   /pair            body {door, session, tracks}      → registra
+//   POST   /pair            body {door, streamSession, tracks} → anuncia sesión
+//   GET    /pair-status?door=puerta1[&wait=N]                → consulta (long-poll, máx 25 s)
+//   POST   /pair-cancel     body {door, session}              → libera (con validación)
+//   GET    /stream-status?door=puerta1                       → sesión de emisión vigente
+//   POST   /stream-clear    body {door, streamSession}        → la puerta dejó de emitir
 // ============================================================
-const returnRegistry = new Map();
 const PAIR_TTL_MS = 12 * 60 * 60 * 1000; // 12 h
+const PAIR_WAIT_MAX_MS = 25000; // long-poll máximo
+const PAIR_WAIT_POLL_MS = 1000; // corte para reevaluar expiración
+
+// ── Almacén en memoria (fallback si no hay Durable Object) ──
+const returnRegistry = new Map();
 
 function pruneExpiredPairs() {
-	const now = Date.now();
 	for (const [key, entry] of returnRegistry) {
-		if (now - entry.at > PAIR_TTL_MS) returnRegistry.delete(key);
+		if (isEmptyRecord(freshRecord(entry))) returnRegistry.delete(key);
 	}
 }
 
@@ -105,12 +124,17 @@ async function proxyCallsRequest(request, url, cf) {
 				headers: withCors(turnRes.headers),
 			});
 		}
+		// Sin credenciales TURN solo hay STUN: suficiente en redes de
+		// escritorio, pero en 4G/5G (CGNAT) la llamada de respuesta
+		// falla de forma intermitente. Publica SFU_TURN_SERVICE_ID y
+		// SFU_TURN_SERVICE_TOKEN para evitarlo.
 		return json(200, {
 			iceServers: [
 				{
 					urls: ["stun:stun.cloudflare.com:3478", "stun:stun.cloudflare.com:53"],
 				},
 			],
+			warning: "Sin credenciales TURN configuradas: la negociación ICE puede fallar en redes móviles.",
 		});
 	}
 
@@ -138,57 +162,330 @@ async function proxyCallsRequest(request, url, cf) {
 // ------------------------------------------------------------
 // Registro cruzado de la llamada (retorno del visor → puerta)
 // ------------------------------------------------------------
-async function handlePair(request, url) {
-	pruneExpiredPairs();
+function normalizeTracks(tracks) {
+	if (!Array.isArray(tracks)) return ["video", "audio"];
+	const list = tracks.map((t) => String(t).trim()).filter(Boolean);
+	return list.length ? list : ["video", "audio"];
+}
 
-	if (url.pathname === "/pair" && request.method === "POST") {
-		// El visor que contestó publica su sesión de retorno.
-		// body: { door: "puerta1", session: "<sessionId retorno>", tracks: ["video","audio"] }
-		let data = {};
+function readPairBody(request) {
+	// Tolera JSON y form-data para no depender de un content-type exacto.
+	const ct = request.headers.get("content-type") || "";
+	if (ct.includes("application/json")) {
+		return request.json().catch(() => ({}));
+	}
+	if (ct.includes("multipart/form-data") || ct.includes("x-www-form-urlencoded")) {
+		return request.formData().then((fd) => ({
+			door: fd.get("door"),
+			session: fd.get("session"),
+			streamSession: fd.get("streamSession"),
+			tracks: fd.getAll ? fd.getAll("tracks") : fd.get("tracks"),
+		}));
+	}
+	return request.text().then((text) => {
 		try {
-			data = await request.json();
+			return JSON.parse(text);
 		} catch (e) {
-			return json(400, { success: false, error: "JSON inválido en /pair" });
+			return Object.fromEntries(new URLSearchParams(text));
 		}
+	});
+}
+
+// Estado por puerta: un único registro con dos campos independientes.
+//   ret    → sesión de retorno publicada por el visor (contestación)
+//   stream → sesión de emisión vigente de la puerta
+// Son independientes a propósito: la puerta anuncia su sesión al
+// empezar a transmitir, mucho antes de que alguien conteste.
+function emptyRecord() {
+	return { ret: null, stream: null };
+}
+
+function freshRecord(record) {
+	const now = Date.now();
+	const out = emptyRecord();
+	if (record) {
+		if (record.ret && now - record.ret.at <= PAIR_TTL_MS) out.ret = record.ret;
+		if (record.stream && now - record.stream.at <= PAIR_TTL_MS) out.stream = record.stream;
+	}
+	return out;
+}
+
+function isEmptyRecord(record) {
+	return !record.ret && !record.stream;
+}
+
+// Aplica una acción y devuelve el registro resultante. `record` puede
+// venir sin filtrar por TTL.
+function applyPairAction(rawRecord, action) {
+	const record = freshRecord(rawRecord);
+	const now = Date.now();
+	let body = { success: true };
+
+	if (action.type === "set") {
+		record.ret = { session: action.session, tracks: normalizeTracks(action.tracks), at: now };
+		body = { success: true, paired: true };
+	} else if (action.type === "stream") {
+		// La puerta anuncia en qué sesión está emitiendo para que el
+		// visor pueda re-apuntarse si la puerta reconectó.
+		record.stream = {
+			session: action.streamSession,
+			tracks: Array.isArray(action.tracks) && action.tracks.length
+				? normalizeTracks(action.tracks)
+				: (record.stream && record.stream.tracks) || ["video", "audio"],
+			at: now,
+		};
+		body = {
+			success: true,
+			streamSession: record.stream.session,
+			streamTracks: record.stream.tracks,
+		};
+	} else if (action.type === "cancel") {
+		// Con sesión: solo se borra si sigue siendo la misma. Así una
+		// segunda pestaña o un segundo visitante no tumba la llamada
+		// del que ya está conectado.
+		if (record.ret && action.session && record.ret.session !== action.session) {
+			body = { success: true, released: false, reason: "sesión distinta" };
+		} else {
+			record.ret = null;
+			body = { success: true, released: true };
+		}
+	} else if (action.type === "clearStream") {
+		// La puerta terminó de emitir: su anuncio se borra para que un
+		// visor con el enlace viejo no se quede apuntando a una sesión
+		// muerta. Con sesión, solo si sigue siendo la misma.
+		if (record.stream && action.streamSession && record.stream.session !== action.streamSession) {
+			body = { success: true, streamCleared: false, reason: "sesión distinta" };
+		} else {
+			record.stream = null;
+			body = { success: true, streamCleared: true };
+		}
+	}
+
+	return { record: isEmptyRecord(record) ? null : record, body };
+}
+
+function pairResponse(record) {
+	// Siempre la misma forma de respuesta, haya o haya registro: así
+	// el cliente no tiene que distinguir entre "no hay" y "vacío".
+	return {
+		success: true,
+		active: !!(record && record.ret && record.ret.session),
+		returnSession: (record && record.ret && record.ret.session) || "",
+		tracks: (record && record.ret && record.ret.tracks) || [],
+		streamSession: (record && record.stream && record.stream.session) || "",
+		streamTracks: (record && record.stream && record.stream.tracks) || [],
+	};
+}
+
+async function handlePair(request, url, env) {
+	const method = request.method.toUpperCase();
+	const path = url.pathname;
+
+	// ── Registro del stream de retorno (POST /pair) ──
+	if (path === "/pair" && method === "POST") {
+		const data = await readPairBody(request);
 		const door = String(data.door || "").trim();
-		const session = String(data.session || "").trim();
-		if (!door || !session) {
-			return json(400, {
-				success: false,
-				error: "Faltan door y/o session en /pair",
+		if (!door) return json(400, { success: false, error: "Falta door en /pair" });
+
+		const streamSession = String(data.streamSession || "").trim();
+		if (streamSession) {
+			const res = await pairCommand(env, door, {
+				type: "stream",
+				streamSession,
+				tracks: data.tracks,
 			});
+			return json(200, res.body);
 		}
-		const tracks = Array.isArray(data.tracks) ? data.tracks.map(String) : ["video", "audio"];
-		returnRegistry.set(door, { returnSession: session, tracks, at: Date.now() });
-		return json(200, { success: true, door, paired: true });
+
+		const session = String(data.session || "").trim();
+		if (!session) {
+			return json(400, { success: false, error: "Faltan door y/o session en /pair" });
+		}
+		const res = await pairCommand(env, door, {
+			type: "set",
+			session,
+			tracks: normalizeTracks(data.tracks),
+		});
+		return json(200, { ...res.body, door });
 	}
 
-	if (url.pathname === "/pair-status") {
-		// La puerta consulta si el visor ya contestó.
-		const door = url.searchParams.get("door");
-		if (door) {
-			const entry = returnRegistry.get(door);
-			if (entry && Date.now() - entry.at <= PAIR_TTL_MS) {
-				return json(200, {
-					success: true,
-					active: true,
-					returnSession: entry.returnSession,
-					tracks: entry.tracks || ["video", "audio"],
-				});
-			}
-			returnRegistry.delete(door);
+	// ── Liberación (POST /pair-cancel) ──
+	if (path === "/pair-cancel") {
+		let door = url.searchParams.get("door") || "";
+		let session = url.searchParams.get("session") || "";
+		if (method !== "GET" && method !== "HEAD") {
+			const data = await readPairBody(request).catch(() => ({}));
+			door = door || String(data.door || "").trim();
+			session = session || String(data.session || "").trim();
 		}
-		return json(200, { success: true, active: false });
+		if (!door) return json(400, { success: false, error: "Falta door en /pair-cancel" });
+		const res = await pairCommand(env, door, { type: "cancel", session });
+		return json(200, { ...res.body, door });
 	}
 
-	if (url.pathname === "/pair-cancel") {
-		// La puerta libera la sesión de retorno al terminar la llamada.
-		const door = url.searchParams.get("door");
-		if (door) returnRegistry.delete(door);
-		return json(200, { success: true, released: true });
+	// ── La puerta deja de emitir (POST /stream-clear) ──
+	if (path === "/stream-clear") {
+		let door = url.searchParams.get("door") || "";
+		let session = url.searchParams.get("streamSession") || "";
+		if (method !== "GET" && method !== "HEAD") {
+			const data = await readPairBody(request).catch(() => ({}));
+			door = door || String(data.door || "").trim();
+			session = session || String(data.streamSession || "").trim();
+		}
+		if (!door) return json(400, { success: false, error: "Falta door en /stream-clear" });
+		const res = await pairCommand(env, door, { type: "clearStream", streamSession: session });
+		return json(200, { ...res.body, door });
+	}
+
+	// ── Consulta desde la puerta (GET /pair-status, con long-poll) ──
+	if (path === "/pair-status") {
+		const door = url.searchParams.get("door") || "";
+		if (!door) return json(400, { success: false, error: "Falta door en /pair-status" });
+		const wait = Math.min(
+			Math.max(Number(url.searchParams.get("wait")) || 0, 0),
+			PAIR_WAIT_MAX_MS
+		);
+		const res = await pairCommand(env, door, { type: "get" }, wait);
+		return json(200, pairResponse(res.record));
+	}
+
+	// ── Sesión de emisión vigente (GET /stream-status) ──
+	if (path === "/stream-status") {
+		const door = url.searchParams.get("door") || "";
+		if (!door) return json(400, { success: false, error: "Falta door en /stream-status" });
+		const res = await pairCommand(env, door, { type: "get" });
+		return json(200, {
+			success: true,
+			active: !!(res.record && res.record.stream),
+			streamSession: (res.record && res.record.stream && res.record.stream.session) || "",
+			streamTracks: (res.record && res.record.stream && res.record.stream.tracks) || [],
+		});
 	}
 
 	return json(404, { success: false, error: "Ruta de pairing no encontrada" });
+}
+
+// ── Acceso al estado: Durable Object si está bound, si no memoria ──
+function hasDurablePairing(env) {
+	return !!(env && env.PAIRING && typeof env.PAIRING.get === "function");
+}
+
+async function pairCommand(env, door, action, waitMs) {
+	if (hasDurablePairing(env)) {
+		const id = env.PAIRING.idFromName(door);
+		const stub = env.PAIRING.get(id);
+		const res = await stub.fetch("https://pairing.internal/cmd", {
+			method: "POST",
+			body: JSON.stringify({ door, action, waitMs: waitMs || 0 }),
+		});
+		const data = await res.json().catch(() => ({ success: true }));
+		return { ...data, record: data.record || null };
+	}
+	return pairCommandMemory(door, action, waitMs);
+}
+
+function sleep(ms) {
+	return new Promise((r) => setTimeout(r, ms));
+}
+
+// Fallback sin Durable Object: mismo comportamiento, pero el estado
+// vive en el isolate (intermitente si hay varias instancias).
+async function pairCommandMemory(door, action, waitMs) {
+	pruneExpiredPairs();
+	let current = returnRegistry.get(door) || null;
+
+	const hasReturn = (rec) => !!(rec && rec.ret && rec.ret.session);
+
+	// Long-poll: espera a que el visor registre el retorno.
+	if (action.type === "get" && waitMs > 0 && !hasReturn(current)) {
+		const deadline = Date.now() + waitMs;
+		while (Date.now() < deadline) {
+			await sleep(PAIR_WAIT_POLL_MS);
+			current = returnRegistry.get(door) || null;
+			if (hasReturn(current)) break;
+		}
+		return { record: freshRecord(current), body: { success: true } };
+	}
+
+	const res = applyPairAction(current, action);
+	if (res.record) returnRegistry.set(door, res.record);
+	else returnRegistry.delete(door);
+	return res;
+}
+
+// ------------------------------------------------------------
+// Durable Object del pairing: una única instancia por puerta,
+// con almacenamiento consistente (fuera de memoria del isolate).
+// ------------------------------------------------------------
+export class Pairing {
+	constructor(state, env) {
+		this.state = state;
+		this.env = env;
+		this.waiters = new Map(); // door → [resolve]
+	}
+
+	async load(door) {
+		const raw = await this.state.storage.get(door);
+		if (!raw) return null;
+		const record = freshRecord(raw);
+		if (isEmptyRecord(record)) {
+			await this.state.storage.delete(door);
+			return null;
+		}
+		return record;
+	}
+
+	async save(door, record) {
+		if (record) await this.state.storage.put(door, record);
+		else await this.state.storage.delete(door);
+		// Despierta a quien esté esperando en long-poll.
+		const list = this.waiters.get(door);
+		if (list && list.length) {
+			this.waiters.delete(door);
+			for (const resolve of list) resolve(record);
+		}
+	}
+
+	async fetch(request) {
+		let payload = {};
+		try {
+			payload = await request.json();
+		} catch (e) {
+			return json(400, { success: false, error: "JSON inválido" });
+		}
+		const door = String(payload.door || "").trim();
+		const action = payload.action || { type: "get" };
+		if (!door) return json(400, { success: false, error: "Falta door" });
+
+		const current = await this.load(door);
+		const hasReturn = !!(current && current.ret && current.ret.session);
+
+		if (action.type === "get" && !hasReturn) {
+			const waitMs = Math.min(Number(payload.waitMs) || 0, PAIR_WAIT_MAX_MS);
+			if (waitMs > 0) {
+				const record = await new Promise((resolve) => {
+					const list = this.waiters.get(door) || [];
+					list.push(resolve);
+					this.waiters.set(door, list);
+					this.state.storage.setAlarm(Date.now() + waitMs + 1000);
+				});
+				return json(200, { success: true, record: record || null });
+			}
+		}
+
+		const res = applyPairAction(current, action);
+		await this.save(door, res.record);
+		return json(200, { success: true, ...res.body, record: res.record || null });
+	}
+
+	// Despierta los long-poll cuando vence la alarma de seguridad.
+	async alarm() {
+		for (const [door, list] of this.waiters) {
+			this.waiters.delete(door);
+			const record = await this.load(door);
+			for (const resolve of list) resolve(record);
+		}
+	}
 }
 
 // ------------------------------------------------------------
@@ -225,13 +522,16 @@ export default {
 
 		// ==========================================================
 		// 1. Registro de llamada bidireccional (retorno del visor)
+		//    /pair · /pair-status · /pair-cancel · /stream-status
 		// ==========================================================
 		if (
 			url.pathname === "/pair" ||
 			url.pathname === "/pair-status" ||
-			url.pathname === "/pair-cancel"
+			url.pathname === "/pair-cancel" ||
+			url.pathname === "/stream-status" ||
+			url.pathname === "/stream-clear"
 		) {
-			return handlePair(request, url);
+			return handlePair(request, url, env);
 		}
 
 		// ==========================================================

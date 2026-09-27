@@ -1,28 +1,52 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "puerta1-ecuador1438",
-  "main": "worker.js",
-  "compatibility_date": "2026-09-09"
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "puerta1-ecuador1438",
+	"main": "worker.js",
+	"compatibility_date": "2026-09-09",
 
-  // ── Secrets Telegram (NO van en este archivo; cárgalos con la CLI o el dashboard):
-  //      wrangler secret put TELEGRAM_BOT_TOKEN
-  //      wrangler secret put TELEGRAM_CHAT_ID
-  //    TELEGRAM_BOT_TOKEN → Token del bot de Telegram
-  //    TELEGRAM_CHAT_ID   → Chat/ID de destino en Telegram
+	// ── Secrets Telegram (NO van en este archivo; cárgalos con la CLI o el dashboard):
+	//      wrangler secret put TELEGRAM_BOT_TOKEN
+	//      wrangler secret put TELEGRAM_CHAT_ID
+	//    TELEGRAM_BOT_TOKEN → Token del bot de Telegram
+	//    TELEGRAM_CHAT_ID   → Chat/ID de destino en Telegram
 
-  // ── Credenciales Cloudflare Calls / Realtime SFU (los entregados por SFU):
-  //    Se aceptan ambos nombres (el Worker resuelve con fallback):
-  //      wrangler secret put ID_app            → App/Application ID de Cloudflare Calls
-  //      wrangler secret put Token_API         → App Secret (API Token) de Cloudflare Calls
-  //    o los nombres convencionales de Cloudflare Meet:
-  //      wrangler secret put CALLS_APP_ID
-  //      wrangler secret put CALLS_APP_SECRET
-  //    TURN opcional (recomendado para redes estrictas):
-  //      wrangler secret put SFU_TURN_SERVICE_ID
-  //      wrangler secret put SFU_TURN_SERVICE_TOKEN
+	// ── Credenciales Cloudflare Calls / Realtime SFU (los entregados por SFU):
+	//    Se aceptan ambos nombres (el Worker resuelve con fallback):
+	//      wrangler secret put ID_app            → App/Application ID de Cloudflare Calls
+	//      wrangler secret put Token_API         → App Secret (API Token) de Cloudflare Calls
+	//    o los nombres convencionales de Cloudflare Meet:
+	//      wrangler secret put CALLS_APP_ID
+	//      wrangler secret put CALLS_APP_SECRET
 
-  // ── KV opcional (recomendado) para límites del timbre:
-  //    "kv_namespaces": [
-  //      { "binding": "TIMBRE_KV", "id": "ID_NAMESPACE_TIMBRE" }
-  //    ]
+	// ── TURN: NECESARIO en redes móviles estrictas (4G/5G, CGNAT).
+	//    Sin esto el Worker solo devuelve STUN y la llamada de respuesta
+	//    falla de forma intermitente. Créalos en el dashboard de Calls
+	//    (o con `wrangler calls turn create`) y publícalos aquí:
+	//      wrangler secret put SFU_TURN_SERVICE_ID
+	//      wrangler secret put SFU_TURN_SERVICE_TOKEN
+
+	// ── Durable Object del pairing (videollamada bidireccional) ──
+	//    Obligatorio para que /pair y /pair-status sean consistentes:
+	//    un Worker sin estado puede atenderlos en isolates distintos.
+	//    Requiere un despliegue con la migración nueva_sqlite_classes:
+	//      npx wrangler deploy
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "PAIRING",
+				"class_name": "Pairing"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["Pairing"]
+		}
+	],
+
+	// ── KV opcional (recomendado) para límites del timbre:
+	//    "kv_namespaces": [
+	//      { "binding": "TIMBRE_KV", "id": "ID_NAMESPACE_TIMBRE" }
+	//    ]
 }
